@@ -1,4 +1,4 @@
-# RestClient
+# Standalone REST Client
 
 A small, standalone REST client in the spirit of Postman. It's a single Java source file with no third-party libraries; it needs only JDK 25.
 
@@ -25,7 +25,7 @@ A small, standalone REST client in the spirit of Postman. It's a single Java sou
   - The response Log tab notes when it was in effect.
   - When it's off and a request fails with an SSL error, the error message suggests turning it on.
 - Settings: timeout, redirects, HTTP/2.
-- Everything auto-saves to `data\workspace.json` in the app's folder (see [Data location](#data-location)).
+- Everything auto-saves to `data\workspace.json` next to the source file (see [Data location](#data-location)).
 
 ## Run
 
@@ -37,17 +37,9 @@ $J = "C:\Soft\jdk-25.0.5.0.2+1\bin"
 
 ## Data location
 
-Collections, environments and settings are saved in one file, `data\workspace.json`, inside the folder the app runs from:
+Collections, environments and settings are saved in one file, `standalone-rest-client\data\workspace.json` (git-ignored), next to the source file.
 
-| How you run it | Workspace file |
-|---|---|
-| `java StandaloneRestClient.java` | `standalone-rest-client\data\workspace.json` (git-ignored) |
-| `java -jar dist\restclient.jar` | `dist\data\workspace.json` |
-| `dist\RestClient\RestClient.exe` | `dist\RestClient\data\workspace.json` |
-
-- **Copying the app:** the `dist\RestClient` folder takes its data with it, so it works as a portable install.
-
-To use a different file, add `-Drestclient.workspace=C:\path\to\workspace.json` to the `java` command, or set it in `JAVA_TOOL_OPTIONS` for the exe.
+To use a different file, add `-Drestclient.workspace=C:\path\to\workspace.json` to the `java` command.
 
 ## Shortcuts
 
