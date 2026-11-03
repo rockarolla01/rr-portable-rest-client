@@ -21,7 +21,6 @@ Status: implemented (v1.0). `README.md` has the user-facing feature list.
 
 ```
 StandaloneRestClient.java   whole application (~2,700 lines)
-build.ps1         compile -> self-tests -> jar -> jpackage app-image (dist\RestClient\RestClient.exe)
 README.md
 ```
 
@@ -43,7 +42,7 @@ Sections inside `StandaloneRestClient.java`, in this order:
      - jar: the jar's folder.
      - `java StandaloneRestClient.java`: the source file's folder.
      - compiled classes: the classes directory.
-   - `data/` is git-ignored, and `build.ps1` keeps `dist\data` and `dist\RestClient\data` across rebuilds.
+   - `data/` is git-ignored.
    - Saves write a temp file and then do an atomic rename.
    - `Storage.copy` deep-copies an item by serializing it and reading it back.
 6. `PostmanImporter`: Postman collection v2.0/v2.1 and environment exports. Returns an `ImportResult` that includes the skipped-features report.
@@ -59,10 +58,7 @@ Sections inside `StandaloneRestClient.java`, in this order:
 ```powershell
 $J = "C:\Soft\jdk-25.0.5.0.2+1\bin"
 & "$J\java.exe" StandaloneRestClient.java              # run from source, no build step
-& "$J\java.exe" StandaloneRestClient.java --selftest   # run self-tests (exit code != 0 on failure)
-.\build.ps1                                  # dist\restclient.jar + dist\RestClient\RestClient.exe
-.\build.ps1 -JarOnly                         # skip jpackage
-```
+& "$J\java.exe" StandaloneRestClient.java --selftest   # run self-tests (exit code != 0 on failure)```
 
 - After any change to `Json`, `Urls`, `Storage`, `PostmanImporter` or `Engine`, run `--selftest`.
 - Add a self-test case when you fix a bug in those sections.

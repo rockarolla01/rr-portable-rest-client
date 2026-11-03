@@ -45,19 +45,9 @@ Collections, environments and settings are saved in one file, `data\workspace.js
 | `java -jar dist\restclient.jar` | `dist\data\workspace.json` |
 | `dist\RestClient\RestClient.exe` | `dist\RestClient\data\workspace.json` |
 
-- **Rebuilding:** `build.ps1` keeps the `data` folders under `dist` when it rebuilds.
 - **Copying the app:** the `dist\RestClient` folder takes its data with it, so it works as a portable install.
 
 To use a different file, add `-Drestclient.workspace=C:\path\to\workspace.json` to the `java` command, or set it in `JAVA_TOOL_OPTIONS` for the exe.
-
-## Build
-
-```powershell
-.\build.ps1             # dist\restclient.jar and dist\RestClient\RestClient.exe (standalone, ~80 MB)
-.\build.ps1 -JarOnly    # jar only
-```
-
-The `dist\RestClient` folder can be copied to any Windows machine and run without installing Java.
 
 ## Shortcuts
 
