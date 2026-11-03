@@ -12,6 +12,7 @@ A small, standalone REST client in the spirit of Postman. It's a single Java sou
 - Query parameters stay in sync with the URL in both directions. Disabled params are kept but not sent.
 - Request headers, each with an enabled checkbox.
 - Request body: none, plain text, JSON (with a "Format JSON" button), or `x-www-form-urlencoded` form fields (a key/value table with enabled checkboxes; keys and values are encoded for you).
+- The request and response body editors have line numbers, and the line with the cursor is highlighted.
 - Response:
   - Status, time, size and HTTP version.
   - JSON bodies are pretty-printed; gzip/deflate bodies are decoded.

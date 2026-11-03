@@ -81,6 +81,9 @@ $J = "C:\Soft\jdk-25.0.5.0.2+1\bin"
   - Text fields use `Highlighter` painters (`Ui.highlightVars`). Table cells use an HTML renderer (`Ui.varHtml`) and a highlighted `JTextField` editor (`KvTable.highlightVariables`).
   - Hover tips: `Ui.varTipAt` reads only about 256 characters around the mouse. A table cell lists every variable in it.
   - Refresh is debounced by `highlightTimer` (150 ms), restarted from `changed()`, so typing, environment switches and variable edits all re-colour. Bodies over 2M characters aren't scanned.
+- **Line numbers:** `LineNumbers.scroll(textArea)` wraps the request and response bodies. It's the scroll pane's row header, and it assumes the text area doesn't wrap lines.
+  - It paints only the visible lines. The width follows the digit count (minimum 2).
+  - Current line: a band in the text area, drawn by a plain (non-layered) highlight painter so it sits under the selection and the variable highlights, plus a bold number in the gutter. It's hidden while the text area is disabled.
 - **Params ↔ URL sync** works in both directions, with the `syncing` guard flag stopping update loops.
   - Editing the URL replaces the enabled params and keeps the disabled ones.
   - Mutate `params` in place: the table holds a reference to the list.

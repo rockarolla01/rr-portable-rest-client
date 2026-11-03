@@ -32,6 +32,7 @@ import javax.swing.table.*;
 import javax.swing.text.BadLocationException;
 import javax.swing.text.DefaultHighlighter;
 import javax.swing.text.Document;
+import javax.swing.text.Element;
 import javax.swing.text.Highlighter;
 import javax.swing.text.JTextComponent;
 import javax.swing.tree.*;
@@ -1413,6 +1414,126 @@ public class StandaloneRestClient {
     // Swing UI
     // =====================================================================================
 
+    /**
+     * Line-number gutter for a non-wrapping text area, shown as its scroll pane's row header. It also
+     * draws a band behind the caret's line in the text area and bolds that line's number.
+     * Only visible lines are painted, so a 10 MB response costs no more than a short one.
+     */
+    static final class LineNumbers extends JComponent {
+        static final Color GUTTER = new Color(0xF3, 0xF3, 0xF3);
+        static final Color BAND = new Color(0xE8, 0xF0, 0xFC);
+        static final Color NUMBER = new Color(0x99, 0x99, 0x99);
+        static final Color CURRENT = new Color(0x33, 0x33, 0x33);
+        static final Color EDGE = new Color(0xDD, 0xDD, 0xDD);
+        private static final int PAD_LEFT = 8, PAD_RIGHT = 8;
+
+        private final JTextArea text;
+        private int caretLine;
+        private int digits;
+
+        static JScrollPane scroll(JTextArea text) {
+            JScrollPane sp = new JScrollPane(text);
+            sp.setRowHeaderView(new LineNumbers(text));
+            return sp;
+        }
+
+        private LineNumbers(JTextArea text) {
+            this.text = text;
+            setFont(text.getFont());
+            // A plain (non-layered) painter runs before the text and the layered selection/variable highlights.
+            try { text.getHighlighter().addHighlight(0, 0, this::paintBand); }
+            catch (BadLocationException ignored) { /* offset 0 always exists */ }
+            // Document listeners run before the text's own views update, hence invokeLater.
+            Ui.onTextChange(text, () -> SwingUtilities.invokeLater(this::textChanged));
+            text.addCaretListener(e -> caretMoved());
+            text.addPropertyChangeListener("font", e -> { setFont(text.getFont()); revalidate(); repaint(); });
+            text.addComponentListener(new ComponentAdapter() {
+                @Override public void componentResized(ComponentEvent e) { revalidate(); }
+            });
+            digits = digits();
+        }
+
+        private int digits() { return Math.max(2, Integer.toString(text.getLineCount()).length()); }
+
+        private int line(int offset) { return text.getDocument().getDefaultRootElement().getElementIndex(offset); }
+
+        private void textChanged() {
+            int d = digits();
+            if (d != digits) { digits = d; revalidate(); }
+            caretMoved();
+            repaint();
+        }
+
+        private void caretMoved() {
+            int line = line(text.getCaretPosition());
+            if (line == caretLine) return;
+            repaintLine(caretLine);
+            caretLine = line;
+            repaintLine(caretLine);
+        }
+
+        private void repaintLine(int line) {
+            Rectangle r = lineBounds(line);
+            if (r == null) return;
+            text.repaint(0, r.y, text.getWidth(), r.height);
+            repaint(0, r.y, getWidth(), r.height);
+        }
+
+        /** Bounds of a line's first character, or null if the line no longer exists. */
+        private Rectangle lineBounds(int line) {
+            Element root = text.getDocument().getDefaultRootElement();
+            if (line < 0 || line >= root.getElementCount()) return null;
+            try {
+                java.awt.geom.Rectangle2D r = text.modelToView2D(root.getElement(line).getStartOffset());
+                return r == null ? null : r.getBounds();
+            } catch (BadLocationException e) {
+                return null;
+            }
+        }
+
+        private void paintBand(Graphics g, int p0, int p1, Shape bounds, JTextComponent c) {
+            if (!c.isEnabled()) return;
+            Rectangle r = lineBounds(caretLine);
+            if (r == null) return;
+            g.setColor(BAND);
+            g.fillRect(0, r.y, c.getWidth(), r.height);
+        }
+
+        @Override public Dimension getPreferredSize() {
+            FontMetrics fm = getFontMetrics(getFont());
+            int width = PAD_LEFT + fm.charWidth('0') * digits + PAD_RIGHT;
+            return new Dimension(width, Math.max(text.getHeight(), text.getPreferredSize().height));
+        }
+
+        @Override protected void paintComponent(Graphics g) {
+            Graphics2D g2 = (Graphics2D) g;
+            if (Toolkit.getDefaultToolkit().getDesktopProperty("awt.font.desktophints") instanceof Map<?, ?> hints)
+                g2.addRenderingHints(hints);
+            Rectangle clip = g.getClipBounds();
+            g.setColor(GUTTER);
+            g.fillRect(clip.x, clip.y, clip.width, clip.height);
+            g.setColor(EDGE);
+            g.drawLine(getWidth() - 1, clip.y, getWidth() - 1, clip.y + clip.height);
+            int first = line(Math.max(0, text.viewToModel2D(new Point(0, clip.y))));
+            int last = line(Math.max(0, text.viewToModel2D(new Point(0, clip.y + clip.height))));
+            Font plain = getFont(), bold = plain.deriveFont(Font.BOLD);
+            for (int line = first; line <= last; line++) {
+                Rectangle r = lineBounds(line);
+                if (r == null) break;
+                boolean current = line == caretLine && text.isEnabled();
+                if (current) {
+                    g.setColor(BAND);
+                    g.fillRect(0, r.y, getWidth() - 1, r.height);
+                }
+                g.setFont(current ? bold : plain);
+                FontMetrics fm = g.getFontMetrics();
+                String n = Integer.toString(line + 1);
+                g.setColor(current ? CURRENT : NUMBER);
+                g.drawString(n, getWidth() - PAD_RIGHT - fm.stringWidth(n), r.y + (r.height - fm.getHeight()) / 2 + fm.getAscent());
+            }
+        }
+    }
+
     /** Editable key/value/enabled table. The last row is a blank "new row": typing into it adds an entry. */
     static final class KvTable extends JPanel {
         final KvModel model;
@@ -2399,7 +2520,7 @@ public class StandaloneRestClient {
                 bodyBar.add(bodyJson);
                 bodyBar.add(bodyForm);
                 bodyBar.add(format);
-                bodyCards.add(new JScrollPane(body), "text");
+                bodyCards.add(LineNumbers.scroll(body), "text");
                 bodyCards.add(form, "form");
                 JPanel bodyPanel = new JPanel(new BorderLayout());
                 bodyPanel.add(bodyBar, BorderLayout.NORTH);
@@ -2658,7 +2779,7 @@ public class StandaloneRestClient {
                 bodyBar.add(pretty);
                 JPanel bodyPanel = new JPanel(new BorderLayout());
                 bodyPanel.add(bodyBar, BorderLayout.NORTH);
-                bodyPanel.add(new JScrollPane(body), BorderLayout.CENTER);
+                bodyPanel.add(LineNumbers.scroll(body), BorderLayout.CENTER);
                 JTable headerTable = new JTable(headerModel);
                 headerTable.setFillsViewportHeight(true);
                 log.setEditable(false);
