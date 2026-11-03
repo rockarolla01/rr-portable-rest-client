@@ -7,6 +7,7 @@ A small, standalone REST client in the spirit of Postman. It's a single Java sou
 - Collections with nested folders, plus rename, duplicate, reorder and delete (right-click the tree).
 - Environments, and collection variables. `{{var}}` placeholders work in the URL, params, headers and body.
   - The active environment wins over collection variables.
+  - In the URL, body, params, headers and form fields, `{{var}}` references are highlighted: orange if the variable is defined, red if not. Hover one to see its value and where it comes from.
   - A few dynamic variables are built in: `{{$guid}}`, `{{$timestamp}}`, `{{$isoTimestamp}}`, `{{$randomInt}}`.
 - Query parameters stay in sync with the URL in both directions. Disabled params are kept but not sent.
 - Request headers, each with an enabled checkbox.

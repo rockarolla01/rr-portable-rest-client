@@ -76,6 +76,11 @@ $J = "C:\Soft\jdk-25.0.5.0.2+1\bin"
   - Values may themselves contain variables (resolved up to 10 levels deep).
   - Built-in dynamic variables: `$guid`, `$randomUUID`, `$timestamp`, `$isoTimestamp`, `$randomInt`.
   - Unresolved `{{x}}` is sent as written and reported in the response Log tab.
+- **Variable highlighting:** `VarLookup` (non-UI, self-tested) finds `{{name}}` references and reports, for each one, whether it exists, its source and its resolved value. It uses the same collection and environment as a send.
+  - Orange = defined (including dynamic variables), red = undefined. It applies to the URL field, the body, and the key/value columns of Params, Headers and Form.
+  - Text fields use `Highlighter` painters (`Ui.highlightVars`). Table cells use an HTML renderer (`Ui.varHtml`) and a highlighted `JTextField` editor (`KvTable.highlightVariables`).
+  - Hover tips: `Ui.varTipAt` reads only about 256 characters around the mouse. A table cell lists every variable in it.
+  - Refresh is debounced by `highlightTimer` (150 ms), restarted from `changed()`, so typing, environment switches and variable edits all re-colour. Bodies over 2M characters aren't scanned.
 - **Params ↔ URL sync** works in both directions, with the `syncing` guard flag stopping update loops.
   - Editing the URL replaces the enabled params and keeps the disabled ones.
   - Mutate `params` in place: the table holds a reference to the list.

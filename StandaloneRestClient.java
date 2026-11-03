@@ -20,6 +20,7 @@ import java.time.*;
 import java.util.*;
 import java.util.List;
 import java.util.concurrent.*;
+import java.util.function.Supplier;
 import java.util.regex.*;
 import java.util.stream.Collectors;
 import java.util.zip.*;
@@ -28,6 +29,10 @@ import javax.swing.*;
 import javax.swing.event.*;
 import javax.swing.filechooser.FileNameExtensionFilter;
 import javax.swing.table.*;
+import javax.swing.text.BadLocationException;
+import javax.swing.text.DefaultHighlighter;
+import javax.swing.text.Document;
+import javax.swing.text.Highlighter;
 import javax.swing.text.JTextComponent;
 import javax.swing.tree.*;
 import javax.swing.undo.UndoManager;
@@ -1074,6 +1079,8 @@ public class StandaloneRestClient {
             return cur;
         }
 
+        static boolean isDynamic(String name) { return dynamic(name) != null; }
+
         private static String dynamic(String name) {
             return switch (name) {
                 case "$guid", "$randomUUID" -> UUID.randomUUID().toString();
@@ -1324,6 +1331,53 @@ public class StandaloneRestClient {
         }
     }
 
+    /**
+     * Says where each {{name}} comes from, for highlighting and hover tips. It uses the same collection
+     * and environment as a send, so the colours match what will actually be sent.
+     */
+    static final class VarLookup {
+        record Ref(int start, int end, String name) { }
+
+        private final Collection collection;
+        private final Environment env;
+        private final Map<String, String> values;
+
+        VarLookup(Collection collection, Environment env) {
+            this.collection = collection;
+            this.env = env;
+            this.values = Engine.variables(collection, env);
+        }
+
+        static List<Ref> refs(String text) {
+            List<Ref> out = new ArrayList<>();
+            Matcher m = Engine.VAR.matcher(text);
+            while (m.find()) out.add(new Ref(m.start(), m.end(), m.group(1).trim()));
+            return out;
+        }
+
+        boolean exists(String name) { return values.containsKey(name) || Engine.isDynamic(name); }
+
+        boolean dynamic(String name) { return !values.containsKey(name) && Engine.isDynamic(name); }
+
+        /** Mirrors the precedence in {@link Engine#variables}; null when nothing defines the name. */
+        String source(String name) {
+            if (env != null && defines(env.vars, name)) return "Environment '" + env.name + "'";
+            if (collection != null && defines(collection.variables, name)) return "Collection '" + collection.name + "'";
+            if (Engine.isDynamic(name)) return "Built-in dynamic variable";
+            return null;
+        }
+
+        /** The value as it would be sent: nested variables resolved, undefined ones collected. */
+        String resolved(String name, Set<String> unresolved) {
+            return Engine.resolve("{{" + name + "}}", values, unresolved);
+        }
+
+        private static boolean defines(List<KeyValue> vars, String name) {
+            for (KeyValue kv : vars) if (kv.active() && kv.key.trim().equals(name)) return true;
+            return false;
+        }
+    }
+
     static String abbreviate(String s, int max) {
         String one = s.replace("\r", "").replace('\n', ' ');
         return one.length() <= max ? one : one.substring(0, max) + "…";
@@ -1363,11 +1417,18 @@ public class StandaloneRestClient {
     static final class KvTable extends JPanel {
         final KvModel model;
         final JTable table;
+        /** Set by {@link #highlightVariables}; null means plain cells. */
+        Supplier<VarLookup> vars;
 
         KvTable(String keyTitle, String valueTitle, Runnable onChange) {
             super(new BorderLayout());
             model = new KvModel(keyTitle, valueTitle, onChange);
-            table = new JTable(model);
+            table = new JTable(model) {
+                @Override public String getToolTipText(MouseEvent e) {
+                    String tip = cellVarTip(e);
+                    return tip != null ? tip : super.getToolTipText(e);
+                }
+            };
             table.putClientProperty("terminateEditOnFocusLost", Boolean.TRUE);
             table.setSurrendersFocusOnKeystroke(true);
             table.setFillsViewportHeight(true);
@@ -1386,6 +1447,41 @@ public class StandaloneRestClient {
             bar.add(hint);
             add(new JScrollPane(table), BorderLayout.CENTER);
             add(bar, BorderLayout.SOUTH);
+        }
+
+        /** Colours {{var}} references in the key and value columns and explains them on hover. */
+        void highlightVariables(Supplier<VarLookup> lookup) {
+            vars = lookup;
+            DefaultTableCellRenderer renderer = new DefaultTableCellRenderer() {
+                @Override public Component getTableCellRendererComponent(JTable t, Object value, boolean selected,
+                                                                         boolean focus, int row, int col) {
+                    super.getTableCellRendererComponent(t, value, selected, focus, row, col);
+                    String text = value == null ? "" : value.toString();
+                    if (text.contains("{{")) setText(Ui.varHtml(text, vars.get()));
+                    return this;
+                }
+            };
+            for (int col = 1; col <= 2; col++) {
+                JTextField field = new JTextField();
+                field.setBorder(BorderFactory.createLineBorder(Color.BLACK));
+                // Highlights can't change inside a document event, hence invokeLater.
+                Ui.onTextChange(field, () -> SwingUtilities.invokeLater(() -> Ui.highlightVars(field, vars.get())));
+                DefaultCellEditor editor = new DefaultCellEditor(field);
+                editor.setClickCountToStart(2);
+                TableColumn c = table.getColumnModel().getColumn(col);
+                c.setCellRenderer(renderer);
+                c.setCellEditor(editor);
+            }
+        }
+
+        private String cellVarTip(MouseEvent e) {
+            if (vars == null) return null;
+            int row = table.rowAtPoint(e.getPoint()), col = table.columnAtPoint(e.getPoint());
+            if (row < 0 || col < 1) return null;
+            Object value = table.getValueAt(row, col);
+            if (value == null) return null;
+            List<String> names = VarLookup.refs(value.toString()).stream().map(VarLookup.Ref::name).distinct().toList();
+            return Ui.varTip(vars.get(), names);
         }
 
         void setRows(List<KeyValue> rows) {
@@ -1473,6 +1569,8 @@ public class StandaloneRestClient {
         final JCheckBox insecureBox = new JCheckBox("Ignore SSL errors");
         final JLabel statusBar = new JLabel(" ");
         final javax.swing.Timer saveTimer = new javax.swing.Timer(700, e -> save());
+        /** Debounces re-highlighting so large bodies aren't rescanned on every keystroke. */
+        final javax.swing.Timer highlightTimer = new javax.swing.Timer(150, e -> { if (this.editor != null) this.editor.refreshHighlights(); });
         final Map<Request, Response> results = new HashMap<>();
         final Map<Request, CompletableFuture<Response>> inFlight = new HashMap<>();
         RequestEditor editor;
@@ -1510,6 +1608,7 @@ public class StandaloneRestClient {
 
         void start() {
             saveTimer.setRepeats(false);
+            highlightTimer.setRepeats(false);
             editor = new RequestEditor();
             responseView = new ResponseView();
 
@@ -1613,6 +1712,90 @@ public class StandaloneRestClient {
             c.getActionMap().put(id, action(r));
         }
 
+        static final Color VAR_DEFINED = new Color(0xFF, 0xCC, 0x80);  // orange
+        static final Color VAR_UNDEFINED = new Color(0xEF, 0x9A, 0x9A); // red
+        static final Highlighter.HighlightPainter VAR_DEFINED_PAINTER = new DefaultHighlighter.DefaultHighlightPainter(VAR_DEFINED);
+        static final Highlighter.HighlightPainter VAR_UNDEFINED_PAINTER = new DefaultHighlighter.DefaultHighlightPainter(VAR_UNDEFINED);
+        /** Past this size a body is not scanned; the highlights are a convenience, not worth a stall. */
+        static final int MAX_HIGHLIGHT_CHARS = 2_000_000;
+
+        /** The variables the selected request would be sent with. */
+        VarLookup lookup() {
+            return new VarLookup(currentNode == null ? null : collectionOf(currentNode), ws.activeEnv());
+        }
+
+        /** Replaces this component's variable highlights; the selection and other highlights are left alone. */
+        static void highlightVars(JTextComponent c, VarLookup vars) {
+            Highlighter h = c.getHighlighter();
+            for (Highlighter.Highlight x : h.getHighlights())
+                if (x.getPainter() == VAR_DEFINED_PAINTER || x.getPainter() == VAR_UNDEFINED_PAINTER) h.removeHighlight(x);
+            Document d = c.getDocument();
+            if (vars == null || d.getLength() > MAX_HIGHLIGHT_CHARS) return;
+            try {
+                for (VarLookup.Ref r : VarLookup.refs(d.getText(0, d.getLength())))
+                    h.addHighlight(r.start(), r.end(), vars.exists(r.name()) ? VAR_DEFINED_PAINTER : VAR_UNDEFINED_PAINTER);
+            } catch (BadLocationException ignored) {
+                // the document changed underneath us; the next refresh redraws
+            }
+        }
+
+        /** Hover text for the variable under the mouse, or null. Reads only a window around the mouse, since this runs on every move. */
+        static String varTipAt(JTextComponent c, MouseEvent e, VarLookup vars) {
+            int off = c.viewToModel2D(e.getPoint());
+            Document d = c.getDocument();
+            if (off < 0 || d.getLength() > MAX_HIGHLIGHT_CHARS) return null;
+            int from = Math.max(0, off - 256), to = Math.min(d.getLength(), off + 256);
+            try {
+                for (VarLookup.Ref r : VarLookup.refs(d.getText(from, to - from)))
+                    if (from + r.start() <= off && off < from + r.end()) return varTip(vars, List.of(r.name()));
+            } catch (BadLocationException ignored) {
+                // nothing to show
+            }
+            return null;
+        }
+
+        static String varTip(VarLookup vars, List<String> names) {
+            if (names.isEmpty()) return null;
+            StringBuilder b = new StringBuilder("<html>");
+            for (String name : names) {
+                if (b.length() > 6) b.append("<br>");
+                b.append("<b>").append(html(name)).append("</b>");
+                String source = vars.source(name);
+                if (source == null) {
+                    b.append(" <font color='#c62828'>is not defined</font> - sent as written");
+                    continue;
+                }
+                if (vars.dynamic(name)) {
+                    b.append(" <i>generated on each send</i>");
+                } else {
+                    Set<String> missing = new TreeSet<>();
+                    String value = vars.resolved(name, missing);
+                    b.append(" = ").append(value.isEmpty() ? "<i>(empty)</i>" : html(abbreviate(value, 120)));
+                    if (!missing.isEmpty())
+                        b.append("<br>&nbsp;&nbsp;<font color='#c62828'>uses undefined: ").append(html(String.join(", ", missing))).append("</font>");
+                }
+                b.append("<br>&nbsp;&nbsp;<font color='gray'>").append(html(source)).append("</font>");
+            }
+            return b.append("</html>").toString();
+        }
+
+        /** Table-cell markup with each reference on an orange or red background. */
+        static String varHtml(String text, VarLookup vars) {
+            StringBuilder b = new StringBuilder("<html><nobr>");
+            int last = 0;
+            for (VarLookup.Ref r : VarLookup.refs(text)) {
+                b.append(cellText(text.substring(last, r.start())));
+                Color c = vars.exists(r.name()) ? VAR_DEFINED : VAR_UNDEFINED;
+                b.append(String.format("<span style='background-color:#%02x%02x%02x'>", c.getRed(), c.getGreen(), c.getBlue()))
+                        .append(cellText(text.substring(r.start(), r.end()))).append("</span>");
+                last = r.end();
+            }
+            return b.append(cellText(text.substring(last))).append("</nobr></html>").toString();
+        }
+
+        /** HTML collapses runs of spaces; a table cell should show them as typed. */
+        private static String cellText(String s) { return html(s).replace(" ", "&nbsp;"); }
+
         static void onTextChange(JTextComponent c, Runnable r) {
             c.getDocument().addDocumentListener(new DocumentListener() {
                 @Override public void insertUpdate(DocumentEvent e) { r.run(); }
@@ -1643,6 +1826,7 @@ public class StandaloneRestClient {
 
         void changed() {
             saveTimer.restart();
+            highlightTimer.restart(); // also covers environment switches and variable edits, which all come through here
             if (editor != null) editor.refreshCurl();
         }
 
@@ -2143,7 +2327,9 @@ public class StandaloneRestClient {
             final JPanel panel = new JPanel(new CardLayout());
             final JLabel breadcrumb = new JLabel(" ");
             final JComboBox<String> method = new JComboBox<>(METHODS);
-            final JTextField url = new JTextField();
+            final JTextField url = new JTextField() {
+                @Override public String getToolTipText(MouseEvent e) { return varTipAt(this, e, lookup()); }
+            };
             final JButton send = new JButton("Send");
             final KvTable params = new KvTable("Key", "Value", this::paramsChanged);
             final KvTable headers = new KvTable("Header", "Value", this::tableChanged);
@@ -2155,7 +2341,9 @@ public class StandaloneRestClient {
             final KvTable form = new KvTable("Key", "Value", this::tableChanged);
             final JPanel bodyCards = new JPanel(new CardLayout());
             final JButton format = new JButton("Format JSON");
-            final JTextArea body = new JTextArea();
+            final JTextArea body = new JTextArea() {
+                @Override public String getToolTipText(MouseEvent e) { return varTipAt(this, e, lookup()); }
+            };
             final UndoManager undo = new UndoManager();
             final JTabbedPane tabs = new JTabbedPane();
             final JTextArea curl = new JTextArea();
@@ -2170,6 +2358,9 @@ public class StandaloneRestClient {
                 method.setPrototypeDisplayValue("OPTIONS  ");
                 method.addActionListener(e -> methodChanged());
                 url.setFont(MONO);
+                ToolTipManager.sharedInstance().registerComponent(url);
+                ToolTipManager.sharedInstance().registerComponent(body);
+                for (KvTable t : List.of(params, headers, form)) t.highlightVariables(Ui.this::lookup);
                 onTextChange(url, this::urlChanged);
                 url.addActionListener(e -> sendOrCancel());
                 send.addActionListener(e -> sendOrCancel());
@@ -2268,6 +2459,7 @@ public class StandaloneRestClient {
                 updateTabTitles();
                 updateSendButton();
                 refreshCurl();
+                refreshHighlights();
                 ((CardLayout) panel.getLayout()).show(panel, "editor");
             }
 
@@ -2297,6 +2489,16 @@ public class StandaloneRestClient {
                 curlPanel.add(bar, BorderLayout.NORTH);
                 curlPanel.add(new JScrollPane(curl), BorderLayout.CENTER);
                 return curlPanel;
+            }
+
+            void refreshHighlights() {
+                if (req == null) return;
+                VarLookup vars = lookup();
+                highlightVars(url, vars);
+                highlightVars(body, vars);
+                params.table.repaint();
+                headers.table.repaint();
+                form.table.repaint();
             }
 
             /** Rebuilt only while the tab is visible, so dynamic variables like {{$guid}} don't churn on every keystroke. */
@@ -2649,6 +2851,21 @@ public class StandaloneRestClient {
             Map<String, String> v = Engine.variables(c, e);
             eq("environment wins", "env.example", v.get("host"));
             eq("disabled ignored", "c", v.get("only"));
+
+            VarLookup lookup = new VarLookup(c, e);
+            eq("var refs", "7-15:host|18-27:nope", VarLookup.refs("http://{{host}}/a/{{ nope}}").stream()
+                    .map(x -> x.start() + "-" + x.end() + ":" + x.name()).collect(Collectors.joining("|")));
+            check("var exists in env", lookup.exists("host"));
+            check("var exists dynamic", lookup.exists("$guid") && lookup.dynamic("$guid"));
+            check("var missing", !lookup.exists("nope"));
+            check("var disabled counts as missing", !new VarLookup(null, e).exists("only"));
+            eq("var source env wins", "Environment 'e'", lookup.source("host"));
+            eq("var source collection", "Collection 'c'", lookup.source("only"));
+            eq("var source missing", null, lookup.source("nope"));
+            c.variables.add(new KeyValue("nested", "{{host}}/{{gone}}", true));
+            Set<String> missing = new TreeSet<>();
+            eq("var resolved nested", "env.example/{{gone}}", new VarLookup(c, e).resolved("nested", missing));
+            eq("var nested missing", Set.of("gone"), missing);
 
             Request r = new Request("p");
             r.setUrl("{{host}}/x");
