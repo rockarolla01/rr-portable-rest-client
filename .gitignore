@@ -1,0 +1,4 @@
+build/
+dist/
+# collections, environments and settings (RestClient workspace)
+data/
