@@ -84,6 +84,10 @@ $J = "C:\Soft\jdk-25.0.5.0.2+1\bin"
 - **Line numbers:** `LineNumbers.scroll(textArea)` wraps the request and response bodies. It's the scroll pane's row header, and it assumes the text area doesn't wrap lines.
   - It paints only the visible lines. The width follows the digit count (minimum 2).
   - Current line: a band in the text area, drawn by a plain (non-layered) highlight painter so it sits under the selection and the variable highlights, plus a bold number in the gutter. It's hidden while the text area is disabled.
+- **Find (Ctrl+F):** `FindBar.wrap(textArea, view)` puts a hidden find bar above the request and response bodies.
+  - It does a literal search, case-insensitive unless Match case is ticked. Highlights are capped at `MAX_MATCHES` (10,000), and the count then shows `+`.
+  - The current match has its own painter (yellow with an outline), because the text area's selection is hidden while the find field has focus. It's also selected, so it stays selected after Esc.
+  - Typing a query jumps from where the search started (`anchor`). A text change only re-highlights (debounced 200 ms) and never moves the caret, so you can keep typing in the body while the bar is open.
 - **Params ↔ URL sync** works in both directions, with the `syncing` guard flag stopping update loops.
   - Editing the URL replaces the enabled params and keeps the disabled ones.
   - Mutate `params` in place: the table holds a reference to the list.

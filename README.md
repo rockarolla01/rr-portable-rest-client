@@ -13,6 +13,10 @@ A small, standalone REST client in the spirit of Postman. It's a single Java sou
 - Request headers, each with an enabled checkbox.
 - Request body: none, plain text, JSON (with a "Format JSON" button), or `x-www-form-urlencoded` form fields (a key/value table with enabled checkboxes; keys and values are encoded for you).
 - The request and response body editors have line numbers, and the line with the cursor is highlighted.
+- **Ctrl+F** in either body opens a find bar. All matches are highlighted, with a count such as "3 of 12", and the search isn't case-sensitive unless you tick **Match case**.
+  - **Enter** / **Shift+Enter** (or **F3** / **Shift+F3**) step forward and back, wrapping around.
+  - Selected text becomes the search term.
+  - **Esc** closes the bar and leaves the current match selected.
 - Response:
   - Status, time, size and HTTP version.
   - JSON bodies are pretty-printed; gzip/deflate bodies are decoded.
@@ -52,6 +56,7 @@ To use a different file, add `-Drestclient.workspace=C:\path\to\workspace.json` 
 - **F2** / **Delete** on the tree: rename or delete.
 - **Delete** in a table: remove the selected rows.
 - **Ctrl+Z** / **Ctrl+Y** in the body editor: undo / redo.
+- **Ctrl+F** in the request or response body: find. **Enter** / **Shift+Enter** or **F3** / **Shift+F3** for the next / previous match; **Esc** closes it.
 
 ## Not supported
 

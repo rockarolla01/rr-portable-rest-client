@@ -1534,6 +1534,192 @@ public class StandaloneRestClient {
         }
     }
 
+    /**
+     * Ctrl+F find bar above a text area. It highlights every match and steps through them with
+     * Enter / Shift+Enter or F3 / Shift+F3. The current match gets its own painter because the
+     * selection is hidden while the find field has focus.
+     */
+    static final class FindBar extends JPanel {
+        static final Color MATCH = new Color(0xFF, 0xF5, 0x9D);
+        static final Color CURRENT = new Color(0xFF, 0xEB, 0x3B);
+        static final Color CURRENT_EDGE = new Color(0x5D, 0x40, 0x37);
+        static final Color NO_MATCH = new Color(0xFF, 0xCD, 0xD2);
+        static final Highlighter.HighlightPainter MATCH_PAINTER = new DefaultHighlighter.DefaultHighlightPainter(MATCH);
+        static final Highlighter.HighlightPainter CURRENT_PAINTER = new DefaultHighlighter.DefaultHighlightPainter(CURRENT) {
+            @Override public Shape paintLayer(Graphics g, int p0, int p1, Shape bounds, JTextComponent c, javax.swing.text.View view) {
+                Shape shape = super.paintLayer(g, p0, p1, bounds, c, view);
+                if (shape != null) {
+                    Rectangle r = shape.getBounds();
+                    g.setColor(CURRENT_EDGE);
+                    g.drawRect(r.x, r.y, Math.max(0, r.width - 1), Math.max(0, r.height - 1));
+                }
+                return shape;
+            }
+        };
+        /** Enough for any realistic search; beyond it a 10 MB body would mean a highlight per character. */
+        static final int MAX_MATCHES = 10_000;
+
+        private final JTextArea text;
+        private final JTextField query = new JTextField(24);
+        private final JCheckBox matchCase = new JCheckBox("Match case");
+        private final JLabel status = new JLabel(" ");
+        /** Re-searches after the text changes (typing in the body, a new response), debounced. */
+        private final javax.swing.Timer refresh = new javax.swing.Timer(200, e -> search(false));
+        private final List<int[]> matches = new ArrayList<>();
+        private final List<Object> tags = new ArrayList<>();
+        private final Color queryBackground = query.getBackground();
+        private int current = -1;
+        private int anchor;
+        private boolean truncated;
+
+        /** The text area's view (e.g. its scroll pane) with a hidden find bar on top. */
+        static JPanel wrap(JTextArea text, JComponent view) {
+            JPanel p = new JPanel(new BorderLayout());
+            p.add(new FindBar(text), BorderLayout.NORTH);
+            p.add(view, BorderLayout.CENTER);
+            return p;
+        }
+
+        private FindBar(JTextArea text) {
+            super(new FlowLayout(FlowLayout.LEFT, 6, 2));
+            this.text = text;
+            setVisible(false);
+            refresh.setRepeats(false);
+            JButton prev = Ui.button("Previous", () -> step(-1));
+            prev.setToolTipText("Previous match (Shift+Enter, Shift+F3)");
+            JButton next = Ui.button("Next", () -> step(1));
+            next.setToolTipText("Next match (Enter, F3)");
+            JButton close = Ui.button("\u00D7", this::close);
+            close.setToolTipText("Close (Esc)");
+            add(new JLabel("Find:"));
+            add(query);
+            add(prev);
+            add(next);
+            add(matchCase);
+            add(status);
+            add(close);
+
+            Ui.onTextChange(query, () -> search(true));
+            matchCase.addActionListener(e -> { search(true); query.requestFocusInWindow(); });
+            Ui.bind(query, "ENTER", () -> step(1));
+            Ui.bind(query, "shift ENTER", () -> step(-1));
+            Ui.bind(query, "F3", () -> step(1));
+            Ui.bind(query, "shift F3", () -> step(-1));
+            Ui.bind(query, "ESCAPE", this::close);
+            Ui.bind(query, "control F", query::selectAll);
+            Ui.bind(text, "control F", this::open);
+            Ui.bind(text, "F3", () -> { if (isVisible()) step(1); else open(); });
+            Ui.bind(text, "shift F3", () -> { if (isVisible()) step(-1); else open(); });
+            Ui.bind(text, "ESCAPE", () -> { if (isVisible()) close(); });
+            Ui.onTextChange(text, () -> { if (isVisible()) refresh.restart(); });
+        }
+
+        void open() {
+            String sel = text.getSelectedText();
+            anchor = text.getSelectionStart();
+            if (sel != null && !sel.isEmpty() && !sel.contains("\n")) query.setText(sel);
+            setVisible(true);
+            revalidate();
+            query.requestFocusInWindow();
+            query.selectAll();
+            search(true);
+        }
+
+        void close() {
+            refresh.stop();
+            setVisible(false);
+            clearHighlights();
+            matches.clear();
+            current = -1;
+            revalidate();
+            text.requestFocusInWindow();
+        }
+
+        /**
+         * Finds every match. Typing a query jumps to the first match at or after where the search
+         * started; a text change only re-highlights, so it never moves the caret while you type.
+         */
+        void search(boolean jump) {
+            refresh.stop();
+            clearHighlights();
+            matches.clear();
+            current = -1;
+            truncated = false;
+            String q = query.getText();
+            if (!isVisible() || q.isEmpty()) { showStatus(); return; }
+            Document d = text.getDocument();
+            String all;
+            try { all = d.getText(0, d.getLength()); }
+            catch (BadLocationException e) { return; }
+            int flags = matchCase.isSelected() ? 0 : Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE;
+            Matcher m = Pattern.compile(Pattern.quote(q), flags).matcher(all);
+            while (m.find()) {
+                if (matches.size() == MAX_MATCHES) { truncated = true; break; }
+                matches.add(new int[] {m.start(), m.end()});
+            }
+            if (!matches.isEmpty()) {
+                int from = jump ? anchor : text.getSelectionStart();
+                current = 0;
+                for (int i = 0; i < matches.size(); i++) if (matches.get(i)[0] >= from) { current = i; break; }
+                Highlighter h = text.getHighlighter();
+                for (int i = 0; i < matches.size(); i++) tags.add(addHighlight(h, i));
+                if (jump) reveal();
+            }
+            showStatus();
+        }
+
+        void step(int delta) {
+            if (!isVisible()) { open(); return; }
+            if (matches.isEmpty()) { search(true); if (matches.isEmpty()) return; }
+            int old = current;
+            current = Math.floorMod(current + delta, matches.size());
+            repaint(old);
+            repaint(current);
+            anchor = matches.get(current)[0]; // refining the query continues from here
+            reveal();
+            showStatus();
+        }
+
+        /** Swaps the painter of one match between "current" and "other". */
+        private void repaint(int i) {
+            if (i < 0 || i >= tags.size()) return;
+            Highlighter h = text.getHighlighter();
+            h.removeHighlight(tags.get(i));
+            tags.set(i, addHighlight(h, i));
+        }
+
+        private Object addHighlight(Highlighter h, int i) {
+            try { return h.addHighlight(matches.get(i)[0], matches.get(i)[1], i == current ? CURRENT_PAINTER : MATCH_PAINTER); }
+            catch (BadLocationException e) { return null; }
+        }
+
+        /** Selects the current match, so closing the bar leaves it selected, and scrolls it into view with some context. */
+        private void reveal() {
+            int[] m = matches.get(current);
+            text.select(m[0], m[1]);
+            try {
+                Rectangle r = text.modelToView2D(m[0]).getBounds().union(text.modelToView2D(m[1]).getBounds());
+                int pad = r.height * 3;
+                text.scrollRectToVisible(new Rectangle(r.x, r.y - pad, r.width, r.height + 2 * pad));
+            } catch (BadLocationException | NullPointerException ignored) {
+                // not laid out yet; the caret move above still scrolls roughly there
+            }
+        }
+
+        private void clearHighlights() {
+            Highlighter h = text.getHighlighter();
+            for (Object tag : tags) if (tag != null) h.removeHighlight(tag);
+            tags.clear();
+        }
+
+        private void showStatus() {
+            boolean none = !query.getText().isEmpty() && matches.isEmpty();
+            query.setBackground(none ? NO_MATCH : queryBackground);
+            status.setText(query.getText().isEmpty() ? " " : none ? "No matches"
+                    : (current + 1) + " of " + matches.size() + (truncated ? "+" : ""));
+        }
+    }
+
     /** Editable key/value/enabled table. The last row is a blank "new row": typing into it adds an entry. */
     static final class KvTable extends JPanel {
         final KvModel model;
@@ -2520,7 +2706,7 @@ public class StandaloneRestClient {
                 bodyBar.add(bodyJson);
                 bodyBar.add(bodyForm);
                 bodyBar.add(format);
-                bodyCards.add(LineNumbers.scroll(body), "text");
+                bodyCards.add(FindBar.wrap(body, LineNumbers.scroll(body)), "text");
                 bodyCards.add(form, "form");
                 JPanel bodyPanel = new JPanel(new BorderLayout());
                 bodyPanel.add(bodyBar, BorderLayout.NORTH);
@@ -2779,7 +2965,7 @@ public class StandaloneRestClient {
                 bodyBar.add(pretty);
                 JPanel bodyPanel = new JPanel(new BorderLayout());
                 bodyPanel.add(bodyBar, BorderLayout.NORTH);
-                bodyPanel.add(LineNumbers.scroll(body), BorderLayout.CENTER);
+                bodyPanel.add(FindBar.wrap(body, LineNumbers.scroll(body)), BorderLayout.CENTER);
                 JTable headerTable = new JTable(headerModel);
                 headerTable.setFillsViewportHeight(true);
                 log.setEditable(false);
