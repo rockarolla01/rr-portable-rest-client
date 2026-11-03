@@ -10,13 +10,14 @@ A small, standalone REST client in the spirit of Postman. It's a single Java sou
   - A few dynamic variables are built in: `{{$guid}}`, `{{$timestamp}}`, `{{$isoTimestamp}}`, `{{$randomInt}}`.
 - Query parameters stay in sync with the URL in both directions. Disabled params are kept but not sent.
 - Request headers, each with an enabled checkbox.
-- Request body: none, plain text, or JSON (with a "Format JSON" button).
+- Request body: none, plain text, JSON (with a "Format JSON" button), or `x-www-form-urlencoded` form fields (a key/value table with enabled checkboxes; keys and values are encoded for you).
 - Response:
   - Status, time, size and HTTP version.
   - JSON bodies are pretty-printed; gzip/deflate bodies are decoded.
   - Response headers, plus a log tab showing the request as it was actually sent and any warnings.
 - Post-processing: after a 2xx response, store the whole body, or a value at a JSON path such as `data.items[0].id`, in an environment variable.
 - Postman import of collections (v2.0 and v2.1) and environments. Unsupported parts are skipped and listed in a report.
+  - Raw (text/JSON) and `urlencoded` bodies are imported.
   - Bearer, basic and API-key auth are converted into headers or params.
   - Simple `pm.environment.set(..., pm.response.json()...)` test scripts become post-processing rules.
 - **Ignore SSL errors**, like `curl -k`, from a checkbox in the toolbar (also in Settings).
@@ -52,4 +53,4 @@ To use a different file, add `-Drestclient.workspace=C:\path\to\workspace.json` 
 
 ## Not supported
 
-Postman scripts (other than the simple variable-setting pattern), form-data, urlencoded and file bodies, other auth types (OAuth, digest, …), cookies management, WebSocket/GraphQL, and export back to Postman.
+Postman scripts (other than the simple variable-setting pattern), multipart form-data and file bodies, other auth types (OAuth, digest, …), cookies management, WebSocket/GraphQL, and export back to Postman.

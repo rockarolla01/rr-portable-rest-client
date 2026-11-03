@@ -34,6 +34,7 @@ Sections inside `StandaloneRestClient.java`, in this order:
 3. Model: `KeyValue(key, value, enabled)`, `BodyMode`, `Item` → `Folder` → `Collection`, `Request`, `Environment`, `Settings`, `Workspace`.
    - `Request` stores `baseUrl` (no query) plus a `params` list. `url()` joins them; `setUrl(text)` splits them.
    - Post-actions are a `List<KeyValue>`: key = variable name, value = JSON path (empty = whole body).
+   - `BodyMode.FORM` uses `Request.form` (a `List<KeyValue>`). It's kept separate from `body`, so switching modes loses nothing.
 4. `Urls`: query parse/join and `encode`, which percent-encodes only illegal characters and keeps existing `%XX` escapes.
 5. `Storage`: the workspace JSON format.
    - The default file is `<appDir>\data\workspace.json`; override it with `-Drestclient.workspace=…`.
@@ -82,7 +83,9 @@ $J = "C:\Soft\jdk-25.0.5.0.2+1\bin"
 - **Default headers** are added unless the user set them:
   - JSON body → `Content-Type: application/json`.
   - Text body → `text/plain; charset=UTF-8`.
+  - Form body → `application/x-www-form-urlencoded`.
   - `User-Agent: RestClient/1.0` and `Accept: */*`.
+- **Form body (`x-www-form-urlencoded`):** `Engine.formBody` substitutes variables in each enabled field first, then encodes the key and value with `URLEncoder` (UTF-8, space → `+`). That way a resolved `&` or `=` can't split a field.
 - **Response display:**
   - Pretty-print when the content type is JSON or the body starts with `{`/`[` and parses. This is computed off the UI thread in `Response.analyze()`.
   - The charset comes from `Content-Type`; gzip/deflate bodies are decoded.
@@ -120,6 +123,7 @@ $J = "C:\Soft\jdk-25.0.5.0.2+1\bin"
   - `url` as a string or an object: uses `raw` for the base, and `query[]` with `disabled`, falling back to parsing the query from `raw`.
   - `header[]` with `disabled`, or v2.0 `"K: V"` header strings.
   - `body.mode=raw`: JSON when `options.raw.language=json`, or when there is no language and the text starts with `{`/`[`; plain text otherwise.
+  - `body.mode=urlencoded` → form body, from `urlencoded[]` with `disabled`. Entries without a key are dropped.
   - Collection `variable[]`.
   - Environment exports `{name, values:[{key,value,enabled}]}`. Imported environment names are made unique.
 - **Auth:**
@@ -136,7 +140,7 @@ $J = "C:\Soft\jdk-25.0.5.0.2+1\bin"
     - an alias created by `var x = pm.response.json()`
   - Anything else is reported.
 - **Ignored and reported:**
-  - Other body modes (formdata, urlencoded, file, graphql) and other auth types.
+  - Other body modes (formdata, file, graphql) and other auth types.
   - Pre-request scripts, scripts on collections or folders, other test code, and path variables.
   - Never fail an import over an unsupported feature.
   - Postman v1 collections are rejected with a clear message.

@@ -365,7 +365,7 @@ public class StandaloneRestClient {
         boolean active() { return enabled && !key.isBlank(); }
     }
 
-    enum BodyMode { NONE, TEXT, JSON }
+    enum BodyMode { NONE, TEXT, JSON, FORM }
 
     abstract static class Item {
         String name;
@@ -395,6 +395,8 @@ public class StandaloneRestClient {
         final List<KeyValue> headers = new ArrayList<>();
         BodyMode bodyMode = BodyMode.NONE;
         String body = "";
+        /** Fields of an x-www-form-urlencoded body; kept apart from {@link #body} so switching modes loses nothing. */
+        final List<KeyValue> form = new ArrayList<>();
         /** key = variable name, value = JSON path (empty = whole body). */
         final List<KeyValue> postActions = new ArrayList<>();
 
@@ -620,6 +622,7 @@ public class StandaloneRestClient {
                 m.put("headers", kvs(r.headers));
                 m.put("bodyMode", r.bodyMode.name().toLowerCase(Locale.ROOT));
                 m.put("body", r.body);
+                m.put("form", kvs(r.form));
                 m.put("postActions", kvs(r.postActions));
             } else if (it instanceof Folder f) {
                 m.put("type", f instanceof Collection ? "collection" : "folder");
@@ -642,6 +645,7 @@ public class StandaloneRestClient {
                 try { r.bodyMode = BodyMode.valueOf(Json.str(m.get("bodyMode")).toUpperCase(Locale.ROOT)); }
                 catch (IllegalArgumentException e) { r.bodyMode = BodyMode.NONE; }
                 r.body = Json.str(m.get("body"));
+                readKvs(m.get("form"), r.form);
                 readKvs(m.get("postActions"), r.postActions);
                 return r;
             }
@@ -840,6 +844,13 @@ public class StandaloneRestClient {
                 boolean json = lang.equals("json") || (lang.isEmpty() && (t.startsWith("{") || t.startsWith("[")));
                 q.body = text;
                 q.bodyMode = json ? BodyMode.JSON : BodyMode.TEXT;
+            } else if (mode.equals("urlencoded")) {
+                for (Object o : Json.arr(b.get("urlencoded"))) {
+                    Map<String, Object> m = Json.obj(o);
+                    if (Json.str(m.get("key")).isEmpty()) continue;
+                    q.form.add(new KeyValue(Json.str(m.get("key")), Json.str(m.get("value")), !Json.bool(m.get("disabled"), false)));
+                }
+                q.bodyMode = BodyMode.FORM;
             } else if (!mode.isEmpty()) {
                 r.skip("Body mode '" + mode + "'");
             }
@@ -1089,7 +1100,11 @@ public class StandaloneRestClient {
             if (p.uri.getHost() == null) throw new IllegalArgumentException("The URL has no valid host: " + url + hint);
             for (KeyValue h : r.headers)
                 if (h.active()) p.headers.add(new String[] {resolve(h.key, vars, unresolved).trim(), resolve(h.value, vars, unresolved)});
-            if (r.bodyMode != BodyMode.NONE) {
+            if (r.bodyMode == BodyMode.FORM) {
+                p.body = formBody(r.form, vars, unresolved);
+                if (!hasHeader(p.headers, "content-type"))
+                    p.headers.add(new String[] {"Content-Type", "application/x-www-form-urlencoded"});
+            } else if (r.bodyMode != BodyMode.NONE) {
                 p.body = resolve(r.body, vars, unresolved);
                 if (!hasHeader(p.headers, "content-type"))
                     p.headers.add(new String[] {"Content-Type", r.bodyMode == BodyMode.JSON ? "application/json" : "text/plain; charset=UTF-8"});
@@ -1098,6 +1113,16 @@ public class StandaloneRestClient {
             if (!hasHeader(p.headers, "accept")) p.addImplicit(new String[] {"Accept", "*/*"});
             if (!unresolved.isEmpty()) p.messages.add("Unresolved variables (sent as written): " + String.join(", ", unresolved));
             return p;
+        }
+
+        /** Variables are substituted before encoding, so a value like "a&b" can't split into two fields. */
+        static String formBody(List<KeyValue> form, Map<String, String> vars, Set<String> unresolved) {
+            StringJoiner j = new StringJoiner("&");
+            for (KeyValue kv : form)
+                if (kv.active())
+                    j.add(URLEncoder.encode(resolve(kv.key, vars, unresolved).trim(), StandardCharsets.UTF_8) + "="
+                            + URLEncoder.encode(resolve(kv.value, vars, unresolved), StandardCharsets.UTF_8));
+            return j.toString();
         }
 
         /**
@@ -2126,6 +2151,9 @@ public class StandaloneRestClient {
             final JRadioButton bodyNone = new JRadioButton("None");
             final JRadioButton bodyText = new JRadioButton("Text");
             final JRadioButton bodyJson = new JRadioButton("JSON");
+            final JRadioButton bodyForm = new JRadioButton("Form (x-www-form-urlencoded)");
+            final KvTable form = new KvTable("Key", "Value", this::tableChanged);
+            final JPanel bodyCards = new JPanel(new CardLayout());
             final JButton format = new JButton("Format JSON");
             final JTextArea body = new JTextArea();
             final UndoManager undo = new UndoManager();
@@ -2159,7 +2187,7 @@ public class StandaloneRestClient {
                 top.add(line, BorderLayout.CENTER);
 
                 ButtonGroup group = new ButtonGroup();
-                for (JRadioButton b : List.of(bodyNone, bodyText, bodyJson)) {
+                for (JRadioButton b : List.of(bodyNone, bodyText, bodyJson, bodyForm)) {
                     group.add(b);
                     b.addActionListener(e -> bodyModeChanged());
                 }
@@ -2178,10 +2206,13 @@ public class StandaloneRestClient {
                 bodyBar.add(bodyNone);
                 bodyBar.add(bodyText);
                 bodyBar.add(bodyJson);
+                bodyBar.add(bodyForm);
                 bodyBar.add(format);
+                bodyCards.add(new JScrollPane(body), "text");
+                bodyCards.add(form, "form");
                 JPanel bodyPanel = new JPanel(new BorderLayout());
                 bodyPanel.add(bodyBar, BorderLayout.NORTH);
-                bodyPanel.add(new JScrollPane(body), BorderLayout.CENTER);
+                bodyPanel.add(bodyCards, BorderLayout.CENTER);
 
                 JLabel help = new JLabel("<html>After a 2xx response, each enabled row stores a value in the active environment "
                         + "(or in the collection variables when no environment is selected).<br>"
@@ -2220,10 +2251,16 @@ public class StandaloneRestClient {
                     params.setRows(r.params);
                     headers.setRows(r.headers);
                     post.setRows(r.postActions);
+                    form.setRows(r.form);
                     body.setText(r.body);
                     body.setCaretPosition(0);
                     undo.discardAllEdits();
-                    (r.bodyMode == BodyMode.JSON ? bodyJson : r.bodyMode == BodyMode.TEXT ? bodyText : bodyNone).setSelected(true);
+                    (switch (r.bodyMode) {
+                        case NONE -> bodyNone;
+                        case TEXT -> bodyText;
+                        case JSON -> bodyJson;
+                        case FORM -> bodyForm;
+                    }).setSelected(true);
                 } finally {
                     loading = false;
                 }
@@ -2285,6 +2322,7 @@ public class StandaloneRestClient {
                 params.stopEditing();
                 headers.stopEditing();
                 post.stopEditing();
+                form.stopEditing();
                 if (req != null) {
                     String typed = String.valueOf(method.getEditor().getItem()).trim().toUpperCase(Locale.ROOT);
                     if (!typed.isEmpty() && !typed.equals(req.method)) {
@@ -2337,7 +2375,9 @@ public class StandaloneRestClient {
 
             void bodyModeChanged() {
                 if (loading || req == null) return;
-                req.bodyMode = bodyJson.isSelected() ? BodyMode.JSON : bodyText.isSelected() ? BodyMode.TEXT : BodyMode.NONE;
+                form.stopEditing();
+                req.bodyMode = bodyJson.isSelected() ? BodyMode.JSON : bodyText.isSelected() ? BodyMode.TEXT
+                        : bodyForm.isSelected() ? BodyMode.FORM : BodyMode.NONE;
                 updateBodyControls();
                 updateTabTitles();
                 changed();
@@ -2345,7 +2385,9 @@ public class StandaloneRestClient {
 
             void updateBodyControls() {
                 body.setEnabled(req != null && req.bodyMode != BodyMode.NONE);
+                format.setVisible(req == null || req.bodyMode != BodyMode.FORM);
                 format.setEnabled(req != null && req.bodyMode == BodyMode.JSON);
+                ((CardLayout) bodyCards.getLayout()).show(bodyCards, req != null && req.bodyMode == BodyMode.FORM ? "form" : "text");
             }
 
             void formatBody() {
@@ -2366,6 +2408,7 @@ public class StandaloneRestClient {
                     case NONE -> "Body";
                     case TEXT -> "Body (Text)";
                     case JSON -> "Body (JSON)";
+                    case FORM -> title("Body (Form)", req.form);
                 });
                 tabs.setTitleAt(3, title("Post-processing", req.postActions));
             }
@@ -2641,6 +2684,20 @@ public class StandaloneRestClient {
                     "curl \\\n  -v \\\n  -L \\\n  --max-time 30 \\\n  http://h.example/", Engine.curl(Engine.prepare(r, Map.of()), s));
             s.curlMultiline = false;
             r.headers.add(new KeyValue("Accept", "application/json", true));
+            Request f = new Request("form");
+            f.method = "POST";
+            f.setUrl("http://h.example/login");
+            f.bodyMode = BodyMode.FORM;
+            f.form.add(new KeyValue("user name", "{{u}}", true));
+            f.form.add(new KeyValue("off", "x", false));
+            f.form.add(new KeyValue("q", "a&b=c \u00fc", true));
+            eq("form body encoded after substitution", "user+name=a%26b&q=a%26b%3Dc+%C3%BC",
+                    Engine.formBody(f.form, Map.of("u", "a&b"), new TreeSet<>()));
+            Settings fs = new Settings();
+            fs.curlMultiline = false;
+            eq("curl form body", "curl -L --max-time 30 -X POST http://h.example/login "
+                    + "-H 'Content-Type: application/x-www-form-urlencoded' --data-raw 'user+name=a%26b&q=a%26b%3Dc+%C3%BC'",
+                    Engine.curl(Engine.prepare(f, Map.of("u", "a&b")), fs));
             eq("curl single line keeps a user-set Accept", "curl -v -L --max-time 30 http://h.example/ -H 'Accept: application/json'",
                     Engine.curl(Engine.prepare(r, Map.of()), s));
         }
@@ -2676,7 +2733,10 @@ public class StandaloneRestClient {
                     {"name": "Plain", "request": "https://example.com/plain?x=1"},
                     {"name": "Digest", "request": {"method": "GET", "auth": {"type": "digest", "digest": []}, "url": "https://example.com"}},
                     {"name": "Key", "request": {"method": "GET", "url": "https://example.com",
-                      "auth": {"type": "apikey", "apikey": [{"key": "key", "value": "k"}, {"key": "value", "value": "v"}, {"key": "in", "value": "query"}]}}}
+                      "auth": {"type": "apikey", "apikey": [{"key": "key", "value": "k"}, {"key": "value", "value": "v"}, {"key": "in", "value": "query"}]}}},
+                    {"name": "Login", "request": {"method": "POST", "url": "{{baseUrl}}/login",
+                      "body": {"mode": "urlencoded", "urlencoded": [{"key": "user", "value": "{{user}}", "type": "text"},
+                        {"key": "debug", "value": "1", "disabled": true}, {"key": "", "value": "blank"}]}}}
                   ]
                 }
                 """;
@@ -2686,7 +2746,7 @@ public class StandaloneRestClient {
             Collection c = ir.collection;
             eq("pm collection name", "Sample", c.name);
             eq("pm collection variables", "baseUrl=https://api.example.com", kvs(c.variables));
-            eq("pm top-level items", 5, c.items.size());
+            eq("pm top-level items", 6, c.items.size());
             Folder users = (Folder) c.items.get(0);
             eq("pm folder", "Users", users.name);
             Request list = (Request) users.items.get(0);
@@ -2707,6 +2767,9 @@ public class StandaloneRestClient {
             eq("pm string request inherits auth", "Bearer {{token}}", header(plain, "Authorization"));
             Request key = (Request) c.items.get(4);
             eq("pm apikey in query", "k=v", kvs(key.params));
+            Request login = (Request) c.items.get(5);
+            eq("pm urlencoded mode", BodyMode.FORM, login.bodyMode);
+            eq("pm urlencoded fields", "user={{user}}|debug=1(off)", kvs(login.form));
             eq("pm skipped report", List.of("Scripts on collections or folders",
                             "Test script code other than pm.environment.set(...) (not run)", "Body mode 'formdata'", "Auth type 'digest'"),
                     List.copyOf(ir.skipped.keySet()));
@@ -2895,6 +2958,18 @@ public class StandaloneRestClient {
                 eq("post token", "abc123", env.vars.stream().filter(v -> v.key.equals("token")).findFirst().map(v -> v.value).orElse(null));
                 eq("post whole body", res.text, env.vars.stream().filter(v -> v.key.equals("whole")).findFirst().map(v -> v.value).orElse(null));
                 check("post missing path reported", log.stream().anyMatch(m -> m.startsWith("Post-processing 'missing' failed")));
+
+                Request fr0 = new Request("form");
+                fr0.method = "POST";
+                fr0.setUrl("http://127.0.0.1:{{port}}/echo");
+                fr0.bodyMode = BodyMode.FORM;
+                fr0.body = "ignored text";
+                fr0.form.add(new KeyValue("b", "{{bval}}", true));
+                fr0.form.add(new KeyValue("n", "{{num}}", true));
+                Map<String, Object> formEcho = Json.obj(Engine.send(Engine.prepare(fr0, Engine.variables(c, env)), s)
+                        .get(15, TimeUnit.SECONDS).json());
+                eq("http form body", "b=x+y&n=5", formEcho.get("body"));
+                eq("http form content type", "application/x-www-form-urlencoded", formEcho.get("contentType"));
 
                 Request g = new Request("gzip");
                 g.setUrl("http://127.0.0.1:{{port}}/gzip");
