@@ -24,6 +24,8 @@ A small, standalone REST client in the spirit of Postman. It's a single Java sou
   - It applies to all requests and is saved with the workspace.
   - The response Log tab notes when it was in effect.
   - When it's off and a request fails with an SSL error, the error message suggests turning it on.
+- A **curl** tab on each request shows the equivalent `curl` command (POSIX shell quoting), with variables resolved and a Copy button.
+  - The **Verbose (-v)** and **Multi-line** checkboxes apply to all requests and are saved with the workspace.
 - Settings: timeout, redirects, HTTP/2.
 - Everything auto-saves to `data\workspace.json` next to the source file (see [Data location](#data-location)).
 

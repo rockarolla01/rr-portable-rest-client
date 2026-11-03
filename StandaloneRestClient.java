@@ -33,7 +33,7 @@ import javax.swing.tree.*;
 import javax.swing.undo.UndoManager;
 
 public class StandaloneRestClient {
-    static final String APP = "RestClient";
+    static final String APP = "StandaloneRestClient";
     static final String VERSION = "1.0";
 
     public static void main(String[] args) throws Exception {
@@ -428,6 +428,10 @@ public class StandaloneRestClient {
         boolean followRedirects = true;
         boolean http2;
         boolean insecureTls;
+        /** Adds -v to the command shown in the request's curl tab. */
+        boolean curlVerbose;
+        /** Splits the curl command over lines with " \" continuations; off gives one line. */
+        boolean curlMultiline = true;
     }
 
     static final class Workspace {
@@ -576,6 +580,8 @@ public class StandaloneRestClient {
             s.put("followRedirects", w.settings.followRedirects);
             s.put("http2", w.settings.http2);
             s.put("insecureTls", w.settings.insecureTls);
+            s.put("curlVerbose", w.settings.curlVerbose);
+            s.put("curlMultiline", w.settings.curlMultiline);
             m.put("settings", s);
             if (w.window != null) m.put("window", Arrays.stream(w.window).boxed().toList());
             m.put("collections", w.collections.stream().map(Storage::item).toList());
@@ -591,6 +597,8 @@ public class StandaloneRestClient {
             w.settings.followRedirects = Json.bool(s.get("followRedirects"), true);
             w.settings.http2 = Json.bool(s.get("http2"), false);
             w.settings.insecureTls = Json.bool(s.get("insecureTls"), false);
+            w.settings.curlVerbose = Json.bool(s.get("curlVerbose"), false);
+            w.settings.curlMultiline = Json.bool(s.get("curlMultiline"), true);
             List<Object> win = Json.arr(m.get("window"));
             if (win.size() >= 4) w.window = win.stream().mapToInt(o -> Json.integer(o, 0)).toArray();
             for (Object o : Json.arr(m.get("collections"))) {
@@ -1010,6 +1018,13 @@ public class StandaloneRestClient {
             final List<String[]> headers = new ArrayList<>();
             String body;
             final List<String> messages = new ArrayList<>();
+            /** Defaults curl already sends on its own (User-Agent, Accept), so the curl tab leaves them out. */
+            final List<String[]> implicit = new ArrayList<>();
+
+            void addImplicit(String[] h) {
+                headers.add(h);
+                implicit.add(h); // matched by identity: String[] has no value equality
+            }
 
             String summary() {
                 StringBuilder b = new StringBuilder(method).append(' ').append(uri);
@@ -1079,10 +1094,37 @@ public class StandaloneRestClient {
                 if (!hasHeader(p.headers, "content-type"))
                     p.headers.add(new String[] {"Content-Type", r.bodyMode == BodyMode.JSON ? "application/json" : "text/plain; charset=UTF-8"});
             }
-            if (!hasHeader(p.headers, "user-agent")) p.headers.add(new String[] {"User-Agent", APP + "/" + VERSION});
-            if (!hasHeader(p.headers, "accept")) p.headers.add(new String[] {"Accept", "*/*"});
+            if (!hasHeader(p.headers, "user-agent")) p.addImplicit(new String[] {"User-Agent", APP + "/" + VERSION});
+            if (!hasHeader(p.headers, "accept")) p.addImplicit(new String[] {"Accept", "*/*"});
             if (!unresolved.isEmpty()) p.messages.add("Unresolved variables (sent as written): " + String.join(", ", unresolved));
             return p;
+        }
+
+        /**
+         * The curl command that sends what {@link #send} would send, in POSIX shell syntax
+         * (bash, Git Bash, WSL). Headers the HTTP client manages itself are left out, as in send.
+         */
+        static String curl(Prepared p, Settings s) {
+            List<String> parts = new ArrayList<>();
+            parts.add("curl");
+            if (s.curlVerbose) parts.add("-v");
+            if (s.insecureTls && "https".equalsIgnoreCase(p.uri.getScheme())) parts.add("-k");
+            if (s.followRedirects) parts.add("-L");
+            if (s.http2) parts.add("--http2");
+            parts.add("--max-time " + Math.max(1, s.timeoutSeconds));
+            if (!p.method.equals("GET") || p.body != null) parts.add("-X " + shellQuote(p.method));
+            parts.add(shellQuote(p.uri.toASCIIString()));
+            for (String[] h : p.headers)
+                if (!RESTRICTED.contains(h[0].toLowerCase(Locale.ROOT)) && !p.implicit.contains(h))
+                    parts.add("-H " + shellQuote(h[0] + ": " + h[1]));
+            if (p.body != null) parts.add("--data-raw " + shellQuote(p.body));
+            return String.join(s.curlMultiline ? " \\\n  " : " ", parts);
+        }
+
+        /** Single quotes keep everything literal; an embedded ' becomes '\''. */
+        static String shellQuote(String v) {
+            if (!v.isEmpty() && v.matches("[A-Za-z0-9_./:@%+=,-]+")) return v;
+            return "'" + v.replace("'", "'\\''") + "'";
         }
 
         private static boolean hasHeader(List<String[]> headers, String name) {
@@ -1576,6 +1618,7 @@ public class StandaloneRestClient {
 
         void changed() {
             saveTimer.restart();
+            if (editor != null) editor.refreshCurl();
         }
 
         void save() {
@@ -2087,6 +2130,10 @@ public class StandaloneRestClient {
             final JTextArea body = new JTextArea();
             final UndoManager undo = new UndoManager();
             final JTabbedPane tabs = new JTabbedPane();
+            final JTextArea curl = new JTextArea();
+            final JCheckBox curlVerbose = new JCheckBox("Verbose (-v)");
+            final JCheckBox curlMultiline = new JCheckBox("Multi-line");
+            JPanel curlPanel;
             Request req;
             boolean loading, syncing;
 
@@ -2149,6 +2196,8 @@ public class StandaloneRestClient {
                 tabs.addTab("Headers", headers);
                 tabs.addTab("Body", bodyPanel);
                 tabs.addTab("Post-processing", postPanel);
+                tabs.addTab("curl", curlPanel());
+                tabs.addChangeListener(e -> refreshCurl());
 
                 JPanel card = new JPanel(new BorderLayout());
                 card.add(top, BorderLayout.NORTH);
@@ -2181,7 +2230,49 @@ public class StandaloneRestClient {
                 updateBodyControls();
                 updateTabTitles();
                 updateSendButton();
+                refreshCurl();
                 ((CardLayout) panel.getLayout()).show(panel, "editor");
+            }
+
+            JPanel curlPanel() {
+                curl.setFont(MONO);
+                curl.setEditable(false);
+                curl.setLineWrap(true);
+                curlVerbose.setSelected(ws.settings.curlVerbose);
+                curlVerbose.setToolTipText("Applies to every request");
+                curlVerbose.addActionListener(e -> {
+                    ws.settings.curlVerbose = curlVerbose.isSelected();
+                    changed();
+                });
+                curlMultiline.setSelected(ws.settings.curlMultiline);
+                curlMultiline.setToolTipText("One option per line with \\ continuations; applies to every request");
+                curlMultiline.addActionListener(e -> {
+                    ws.settings.curlMultiline = curlMultiline.isSelected();
+                    changed();
+                });
+                JButton copy = button("Copy", () -> Toolkit.getDefaultToolkit().getSystemClipboard()
+                        .setContents(new java.awt.datatransfer.StringSelection(curl.getText()), null));
+                JPanel bar = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 2));
+                bar.add(curlVerbose);
+                bar.add(curlMultiline);
+                bar.add(copy);
+                curlPanel = new JPanel(new BorderLayout());
+                curlPanel.add(bar, BorderLayout.NORTH);
+                curlPanel.add(new JScrollPane(curl), BorderLayout.CENTER);
+                return curlPanel;
+            }
+
+            /** Rebuilt only while the tab is visible, so dynamic variables like {{$guid}} don't churn on every keystroke. */
+            void refreshCurl() {
+                if (req == null || tabs.getSelectedComponent() != curlPanel) return;
+                String text;
+                try {
+                    text = Engine.curl(Engine.prepare(req, Engine.variables(collectionOf(currentNode), ws.activeEnv())), ws.settings);
+                } catch (IllegalArgumentException e) {
+                    text = "# " + e.getMessage();
+                }
+                curl.setText(text);
+                curl.setCaretPosition(0);
             }
 
             void showEmpty() {
@@ -2411,6 +2502,7 @@ public class StandaloneRestClient {
             t.section("json", t::json);
             t.section("urls", t::urls);
             t.section("variables", t::variables);
+            t.section("curl", t::curl);
             t.section("postman", t::postman);
             t.section("storage", t::storage);
             t.section("http", t::http);
@@ -2525,6 +2617,34 @@ public class StandaloneRestClient {
             fails("ftp rejected", () -> Engine.prepare(r, v));
         }
 
+        void curl() {
+            Request r = new Request("c");
+            r.method = "POST";
+            r.setUrl("https://{{host}}/a?x=1&y=2");
+            r.headers.add(new KeyValue("X-Note", "it's", true));
+            r.headers.add(new KeyValue("Connection", "close", true));
+            r.bodyMode = BodyMode.JSON;
+            r.body = "{\"a\": \"{{host}}\"}";
+            Settings s = new Settings();
+            s.insecureTls = true;
+            String cmd = Engine.curl(Engine.prepare(r, Map.of("host", "h.example")), s);
+            eq("curl command", String.join(" \\\n  ",
+                    "curl", "-k", "-L", "--max-time 30", "-X POST", "'https://h.example/a?x=1&y=2'",
+                    "-H 'X-Note: it'\\''s'", "-H 'Content-Type: application/json'",
+                    "--data-raw '{\"a\": \"h.example\"}'"), cmd);
+            s.curlVerbose = true;
+            r.method = "GET";
+            r.bodyMode = BodyMode.NONE;
+            r.headers.clear();
+            r.setUrl("http://h.example/");
+            eq("curl verbose, GET has no -X, -k only for https",
+                    "curl \\\n  -v \\\n  -L \\\n  --max-time 30 \\\n  http://h.example/", Engine.curl(Engine.prepare(r, Map.of()), s));
+            s.curlMultiline = false;
+            r.headers.add(new KeyValue("Accept", "application/json", true));
+            eq("curl single line keeps a user-set Accept", "curl -v -L --max-time 30 http://h.example/ -H 'Accept: application/json'",
+                    Engine.curl(Engine.prepare(r, Map.of()), s));
+        }
+
         static final String SAMPLE = """
                 {
                   "info": {"name": "Sample", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
@@ -2611,6 +2731,8 @@ public class StandaloneRestClient {
             w.activeEnvironment = "Dev";
             w.settings.timeoutSeconds = 7;
             w.settings.insecureTls = true;
+            w.settings.curlVerbose = true;
+            w.settings.curlMultiline = false;
             w.window = new int[] {1, 2, 800, 600, 0};
             String once = Json.write(Storage.toJson(w));
             eq("storage round trip", once, Json.write(Storage.toJson(Storage.fromJson(Json.obj(Json.parse(once))))));
