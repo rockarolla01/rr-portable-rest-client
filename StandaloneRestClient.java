@@ -36,6 +36,7 @@ import javax.swing.text.Element;
 import javax.swing.text.Highlighter;
 import javax.swing.text.JTextComponent;
 import javax.swing.tree.*;
+import javax.swing.undo.CompoundEdit;
 import javax.swing.undo.UndoManager;
 
 public class StandaloneRestClient {
@@ -1745,6 +1746,12 @@ public class StandaloneRestClient {
             check.setMaxWidth(32);
             table.getInputMap(JComponent.WHEN_FOCUSED).put(KeyStroke.getKeyStroke(KeyEvent.VK_DELETE, 0), "rc-remove");
             table.getActionMap().put("rc-remove", Ui.action(this::removeSelected));
+            // Ancestor scope so the keys also work while a cell editor has focus.
+            InputMap keys = table.getInputMap(JComponent.WHEN_ANCESTOR_OF_FOCUSED_COMPONENT);
+            keys.put(KeyStroke.getKeyStroke("control Z"), "rc-undo");
+            keys.put(KeyStroke.getKeyStroke("control Y"), "rc-redo");
+            table.getActionMap().put("rc-undo", Ui.action(this::undo));
+            table.getActionMap().put("rc-redo", Ui.action(this::redo));
             JButton remove = new JButton("Remove selected");
             remove.addActionListener(e -> removeSelected());
             JLabel hint = new JLabel("Type in the last row to add an entry.");
@@ -1794,10 +1801,40 @@ public class StandaloneRestClient {
         void setRows(List<KeyValue> rows) {
             stopEditing();
             model.rows = rows;
+            model.history.clear();
             model.fireTableDataChanged();
         }
 
-        void refresh() { model.fireTableDataChanged(); }
+        /** The rows were changed outside the table (e.g. from the URL), so older snapshots no longer apply. */
+        void refresh() {
+            model.history.clear();
+            model.fireTableDataChanged();
+        }
+
+        void undo() {
+            // While a cell is being edited, Ctrl+Z first throws away the typed text.
+            if (table.isEditing()) { table.getCellEditor().cancelCellEditing(); return; }
+            restore(model.history.undo(model.rows));
+        }
+
+        void redo() {
+            stopEditing();
+            restore(model.history.redo(model.rows));
+        }
+
+        private void restore(KvHistory.Snapshot s) {
+            if (s == null || model.rows == null) return;
+            // Mutate in place: the request (and the params/URL sync) holds a reference to this list.
+            model.rows.clear();
+            for (KeyValue kv : s.rows()) model.rows.add(kv.copy());
+            model.fireTableDataChanged();
+            int row = Math.min(s.row(), table.getRowCount() - 1);
+            if (row >= 0) {
+                table.setRowSelectionInterval(row, row);
+                table.scrollRectToVisible(table.getCellRect(row, 0, true));
+            }
+            model.onChange.run();
+        }
 
         void stopEditing() {
             if (table.isEditing()) table.getCellEditor().stopCellEditing();
@@ -1807,19 +1844,60 @@ public class StandaloneRestClient {
             stopEditing();
             if (model.rows == null) return;
             int[] sel = table.getSelectedRows();
+            List<KeyValue> before = KvHistory.copy(model.rows);
             boolean removed = false;
             for (int i = sel.length - 1; i >= 0; i--) {
                 if (sel[i] < model.rows.size()) { model.rows.remove(sel[i]); removed = true; }
             }
             if (!removed) return;
+            model.history.record(before, sel[0]);
             model.fireTableDataChanged();
             model.onChange.run();
+        }
+    }
+
+    /** Undo/redo for a key/value table, as whole-table snapshots (tables are small, so this stays simple). */
+    static final class KvHistory {
+        record Snapshot(List<KeyValue> rows, int row) { }
+
+        static final int LIMIT = 200;
+        private final ArrayDeque<Snapshot> undo = new ArrayDeque<>();
+        private final ArrayDeque<Snapshot> redo = new ArrayDeque<>();
+
+        static List<KeyValue> copy(List<KeyValue> rows) {
+            List<KeyValue> out = new ArrayList<>();
+            if (rows != null) for (KeyValue kv : rows) out.add(kv.copy());
+            return out;
+        }
+
+        /** Call with the rows as they were before a user edit; {@code row} is the row the edit touched. */
+        void record(List<KeyValue> before, int row) {
+            undo.push(new Snapshot(before, row));
+            if (undo.size() > LIMIT) undo.removeLast();
+            redo.clear();
+        }
+
+        Snapshot undo(List<KeyValue> current) { return step(undo, redo, current); }
+
+        Snapshot redo(List<KeyValue> current) { return step(redo, undo, current); }
+
+        private static Snapshot step(ArrayDeque<Snapshot> from, ArrayDeque<Snapshot> to, List<KeyValue> current) {
+            if (from.isEmpty() || current == null) return null;
+            Snapshot s = from.pop();
+            to.push(new Snapshot(copy(current), s.row()));
+            return s;
+        }
+
+        void clear() {
+            undo.clear();
+            redo.clear();
         }
     }
 
     static final class KvModel extends AbstractTableModel {
         final String[] columns;
         final Runnable onChange;
+        final KvHistory history = new KvHistory();
         List<KeyValue> rows;
 
         KvModel(String keyTitle, String valueTitle, Runnable onChange) {
@@ -1845,11 +1923,14 @@ public class StandaloneRestClient {
             if (r >= rows.size()) {
                 String s = String.valueOf(v);
                 if (c == 0 || s.isEmpty()) return;
+                history.record(KvHistory.copy(rows), r);
                 rows.add(c == 1 ? new KeyValue(s, "", true) : new KeyValue("", s, true));
                 fireTableRowsUpdated(r, r);
                 fireTableRowsInserted(r + 1, r + 1);
             } else {
                 KeyValue kv = rows.get(r);
+                if (Objects.equals(getValueAt(r, c), c == 0 ? (Object) Boolean.TRUE.equals(v) : String.valueOf(v))) return;
+                history.record(KvHistory.copy(rows), r);
                 if (c == 0) kv.enabled = Boolean.TRUE.equals(v);
                 else if (c == 1) kv.key = String.valueOf(v);
                 else kv.value = String.valueOf(v);
@@ -2652,6 +2733,9 @@ public class StandaloneRestClient {
                 @Override public String getToolTipText(MouseEvent e) { return varTipAt(this, e, lookup()); }
             };
             final UndoManager undo = new UndoManager();
+            final UndoManager urlUndo = new UndoManager();
+            /** Collects a URL rewrite made from the Params table, so it undoes as one step. */
+            CompoundEdit urlSync;
             final JTabbedPane tabs = new JTabbedPane();
             final JTextArea curl = new JTextArea();
             final JCheckBox curlVerbose = new JCheckBox("Verbose (-v)");
@@ -2669,6 +2753,13 @@ public class StandaloneRestClient {
                 ToolTipManager.sharedInstance().registerComponent(body);
                 for (KvTable t : List.of(params, headers, form)) t.highlightVariables(Ui.this::lookup);
                 onTextChange(url, this::urlChanged);
+                url.getDocument().addUndoableEditListener(e -> {
+                    if (loading) return;
+                    if (urlSync != null) urlSync.addEdit(e.getEdit());
+                    else urlUndo.addEdit(e.getEdit());
+                });
+                bind(url, "control Z", () -> { if (urlUndo.canUndo()) urlUndo.undo(); });
+                bind(url, "control Y", () -> { if (urlUndo.canRedo()) urlUndo.redo(); });
                 url.addActionListener(e -> sendOrCancel());
                 send.addActionListener(e -> sendOrCancel());
                 send.setPreferredSize(new Dimension(90, send.getPreferredSize().height));
@@ -2753,6 +2844,7 @@ public class StandaloneRestClient {
                     body.setText(r.body);
                     body.setCaretPosition(0);
                     undo.discardAllEdits();
+                    urlUndo.discardAllEdits();
                     (switch (r.bodyMode) {
                         case NONE -> bodyNone;
                         case TEXT -> bodyText;
@@ -2866,11 +2958,19 @@ public class StandaloneRestClient {
 
             void paramsChanged() {
                 if (loading || syncing || req == null) return;
-                syncing = true;
-                try {
-                    url.setText(req.url());
-                } finally {
-                    syncing = false;
+                String text = req.url();
+                if (!text.equals(url.getText())) {
+                    // Recorded rather than skipped: later URL edits are position-based and must stay in step.
+                    syncing = true;
+                    urlSync = new CompoundEdit();
+                    try {
+                        url.setText(text);
+                    } finally {
+                        syncing = false;
+                        urlSync.end();
+                        urlUndo.addEdit(urlSync);
+                        urlSync = null;
+                    }
                 }
                 updateTabTitles();
                 changed();

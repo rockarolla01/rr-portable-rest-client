@@ -55,7 +55,8 @@ To use a different file, add `-Drestclient.workspace=C:\path\to\workspace.json` 
 - **Ctrl+Enter**, or **Enter** in the URL field: send. While a request is running, Ctrl+Enter or the button cancels it.
 - **F2** / **Delete** on the tree: rename or delete.
 - **Delete** in a table: remove the selected rows.
-- **Ctrl+Z** / **Ctrl+Y** in the body editor: undo / redo.
+- **Ctrl+Z** / **Ctrl+Y** in the body editor or the URL field: undo / redo. A URL change made from the Params table undoes as one step.
+- **Ctrl+Z** / **Ctrl+Y** in a table (Params, Headers, Form, Post-processing, variables): undo / redo cell edits, added rows and removed rows. While a cell is being edited, Ctrl+Z first discards the typed text. Opening another request starts a fresh history.
 - **Ctrl+F** in the request or response body: find. **Enter** / **Shift+Enter** or **F3** / **Shift+F3** for the next / previous match; **Esc** closes it.
 
 ## Not supported

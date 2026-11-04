@@ -88,6 +88,14 @@ $J = "C:\Soft\jdk-25.0.5.0.2+1\bin"
   - It does a literal search, case-insensitive unless Match case is ticked. Highlights are capped at `MAX_MATCHES` (10,000), and the count then shows `+`.
   - The current match has its own painter (yellow with an outline), because the text area's selection is hidden while the find field has focus. It's also selected, so it stays selected after Esc.
   - Typing a query jumps from where the search started (`anchor`). A text change only re-highlights (debounced 200 ms) and never moves the caret, so you can keep typing in the body while the bar is open.
+- **Table undo (Ctrl+Z / Ctrl+Y):** `KvHistory` keeps whole-table snapshots (max 200) per `KvModel`.
+  - `KvModel.setValueAt` (skipping no-op edits) and `KvTable.removeSelected` record the rows as they were before the change.
+  - Restoring mutates `rows` in place and calls `onChange`, so undo in Params also rewrites the URL.
+  - The keys are bound `WHEN_ANCESTOR_OF_FOCUSED_COMPONENT`. While a cell is being edited, Ctrl+Z cancels the edit instead.
+  - `setRows` (opening a request) and `refresh` (rows changed from outside, e.g. typing in the URL) clear the history, because older snapshots no longer apply.
+- **URL undo:** `RequestEditor.urlUndo`, cleared in `load`.
+  - A URL rewrite from `paramsChanged` is recorded too, wrapped in one `CompoundEdit` (`urlSync`). Document undo edits are position-based, so skipping a programmatic change would break later undos.
+  - Undoing in the URL goes through `urlChanged`, which updates the params and so clears the Params table history.
 - **Params ↔ URL sync** works in both directions, with the `syncing` guard flag stopping update loops.
   - Editing the URL replaces the enabled params and keeps the disabled ones.
   - Mutate `params` in place: the table holds a reference to the list.
