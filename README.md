@@ -5,6 +5,16 @@ A small, standalone REST client in the spirit of Postman. It's a single Java sou
 ## Features
 
 - Collections with nested folders, plus rename, duplicate, reorder and delete (right-click the tree).
+- Requests open in tabs:
+  - A single click in the tree opens a *preview* tab (italic title), and the next click reuses it. Double-click the request or its tab, edit it, or send it to keep the tab open.
+  - Each tab has its own undo history, caret, scroll position, find bar and sub-tab, plus its own last response.
+  - Drag tabs to reorder them. When there are more tabs than fit, the row scrolls with the ‹ › arrows or the mouse wheel. The **▾** button lists every open tab, with a filter field.
+  - Right-click a tab for Save, Revert Changes, Close, Close Others, Close to the Right, Close Saved and Reveal in Tree. Middle-click closes a tab.
+- Edits stay in the tab until you save them with **Ctrl+S** or the **Save** button.
+  - A ● on the tab and in the tree marks unsaved changes. Undoing back to the saved state clears it.
+  - **Send** and the curl tab use what you see, saved or not.
+  - Closing a tab with unsaved changes asks whether to save them. Exiting doesn't ask: open tabs and their unsaved drafts are restored the next time you start the app.
+  - Rename, move, duplicate (which copies the saved version) and delete in the tree, environments, variables and settings still save at once.
 - Environments, and collection variables. `{{var}}` placeholders work in the URL, params, headers and body.
   - The active environment wins over collection variables.
   - In the URL, body, params, headers and form fields, `{{var}}` references are highlighted: orange if the variable is defined, red if not. Hover one to see its value and where it comes from.
@@ -34,7 +44,7 @@ A small, standalone REST client in the spirit of Postman. It's a single Java sou
 - A **curl** tab on each request shows the equivalent `curl` command (POSIX shell quoting), with variables resolved and a Copy button.
   - The **Verbose (-v)** and **Multi-line** checkboxes apply to all requests and are saved with the workspace.
 - Settings: timeout, redirects, HTTP/2.
-- Everything auto-saves to `data\workspace.json` next to the source file (see [Data location](#data-location)).
+- Everything else auto-saves to `data\workspace.json` next to the source file (see [Data location](#data-location)).
 
 ## Run
 
@@ -46,17 +56,21 @@ $J = "C:\Soft\jdk-25.0.5.0.2+1\bin"
 
 ## Data location
 
-Collections, environments and settings are saved in one file, `standalone-rest-client\data\workspace.json` (git-ignored), next to the source file.
+Collections, environments, settings and the open tabs (with their unsaved drafts) are saved in one file, `standalone-rest-client\data\workspace.json` (git-ignored), next to the source file.
 
 To use a different file, add `-Drestclient.workspace=C:\path\to\workspace.json` to the `java` command.
 
 ## Shortcuts
 
 - **Ctrl+Enter**, or **Enter** in the URL field: send. While a request is running, Ctrl+Enter or the button cancels it.
+- **Ctrl+S**: save the current tab. **Ctrl+Shift+S**: save all tabs.
+- **Ctrl+W**: close the current tab.
+- **Ctrl+Tab** / **Ctrl+Shift+Tab**, or **Ctrl+PgDn** / **Ctrl+PgUp**: next / previous tab.
+- **Enter** on a request in the tree: open it in a tab that stays open.
 - **F2** / **Delete** on the tree: rename or delete.
 - **Delete** in a table: remove the selected rows.
-- **Ctrl+Z** / **Ctrl+Y** in the body editor or the URL field: undo / redo. A URL change made from the Params table undoes as one step.
-- **Ctrl+Z** / **Ctrl+Y** in a table (Params, Headers, Form, Post-processing, variables): undo / redo cell edits, added rows and removed rows. While a cell is being edited, Ctrl+Z first discards the typed text. Opening another request starts a fresh history.
+- **Ctrl+Z** / **Ctrl+Y** in the body editor or the URL field: undo / redo, separately in each tab. A URL change made from the Params table undoes as one step.
+- **Ctrl+Z** / **Ctrl+Y** in a table (Params, Headers, Form, Post-processing, variables): undo / redo cell edits, added rows and removed rows. While a cell is being edited, Ctrl+Z first discards the typed text. Saving keeps the history; closing the tab discards it.
 - **Ctrl+F** in the request or response body: find. **Enter** / **Shift+Enter** or **F3** / **Shift+F3** for the next / previous match; **Esc** closes it.
 
 ## Not supported

@@ -395,6 +395,8 @@ public class StandaloneRestClient {
     }
 
     static final class Request extends Item {
+        /** Stable identity across restarts, so open tabs and their drafts can find their request again. */
+        String id = UUID.randomUUID().toString();
         String method = "GET";
         /** URL without the query string; the query lives in {@link #params} so disabled params survive. */
         String baseUrl = "";
@@ -421,7 +423,29 @@ public class StandaloneRestClient {
             params.addAll(parsed);
             params.addAll(disabled);
         }
+
+        /** Takes every editable field from {@code o}; the name and id stay, since rename is not buffered. */
+        void copyFrom(Request o) {
+            method = o.method;
+            baseUrl = o.baseUrl;
+            bodyMode = o.bodyMode;
+            body = o.body;
+            copyRows(o.params, params);
+            copyRows(o.headers, headers);
+            copyRows(o.form, form);
+            copyRows(o.postActions, postActions);
+        }
+
+        /** In place, because editor tables hold a reference to the list. */
+        private static void copyRows(List<KeyValue> from, List<KeyValue> to) {
+            List<KeyValue> rows = from.stream().map(KeyValue::copy).toList();
+            to.clear();
+            to.addAll(rows);
+        }
     }
+
+    /** A request tab left open when the app closed: draft is null when it had no unsaved changes. */
+    record OpenTab(String requestId, boolean preview, Request draft) { }
 
     static final class Environment {
         String name;
@@ -450,9 +474,28 @@ public class StandaloneRestClient {
         final Settings settings = new Settings();
         /** x, y, width, height, maximized(0/1); null until the window has been closed once. */
         int[] window;
+        /** Open request tabs in strip order, and the id of the selected one. */
+        final List<OpenTab> openTabs = new ArrayList<>();
+        String selectedTab = "";
 
         Environment activeEnv() {
             for (Environment e : environments) if (e.name.equals(activeEnvironment)) return e;
+            return null;
+        }
+
+        Request findRequest(String id) {
+            for (Collection c : collections) {
+                Request r = findRequest(c, id);
+                if (r != null) return r;
+            }
+            return null;
+        }
+
+        static Request findRequest(Folder f, String id) {
+            for (Item it : f.items) {
+                Request r = it instanceof Folder sub ? findRequest(sub, id) : it instanceof Request q && q.id.equals(id) ? q : null;
+                if (r != null) return r;
+            }
             return null;
         }
     }
@@ -595,6 +638,20 @@ public class StandaloneRestClient {
             if (w.window != null) m.put("window", Arrays.stream(w.window).boxed().toList());
             m.put("collections", w.collections.stream().map(Storage::item).toList());
             m.put("environments", w.environments.stream().map(Storage::env).toList());
+            if (!w.openTabs.isEmpty()) {
+                Map<String, Object> session = new LinkedHashMap<>();
+                session.put("selected", w.selectedTab);
+                List<Object> tabs = new ArrayList<>();
+                for (OpenTab t : w.openTabs) {
+                    Map<String, Object> tab = new LinkedHashMap<>();
+                    tab.put("id", t.requestId());
+                    tab.put("preview", t.preview());
+                    if (t.draft() != null) tab.put("draft", item(t.draft()));
+                    tabs.add(tab);
+                }
+                session.put("tabs", tabs);
+                m.put("session", session);
+            }
             return m;
         }
 
@@ -615,6 +672,15 @@ public class StandaloneRestClient {
                 if (it instanceof Collection c) w.collections.add(c);
             }
             for (Object o : Json.arr(m.get("environments"))) w.environments.add(env(Json.obj(o)));
+            Map<String, Object> session = Json.obj(m.get("session"));
+            w.selectedTab = Json.str(session.get("selected"));
+            for (Object o : Json.arr(session.get("tabs"))) {
+                Map<String, Object> tab = Json.obj(o);
+                String id = Json.str(tab.get("id"));
+                if (id.isEmpty()) continue;
+                Request draft = tab.get("draft") != null && item(Json.obj(tab.get("draft"))) instanceof Request r ? r : null;
+                w.openTabs.add(new OpenTab(id, Json.bool(tab.get("preview"), false), draft));
+            }
             return w;
         }
 
@@ -622,6 +688,7 @@ public class StandaloneRestClient {
             Map<String, Object> m = new LinkedHashMap<>();
             if (it instanceof Request r) {
                 m.put("type", "request");
+                m.put("id", r.id);
                 m.put("name", r.name);
                 m.put("method", r.method);
                 m.put("url", r.baseUrl);
@@ -645,6 +712,7 @@ public class StandaloneRestClient {
             String name = Json.str(m.get("name"));
             if (type.equals("request")) {
                 Request r = new Request(name);
+                if (!Json.str(m.get("id")).isEmpty()) r.id = Json.str(m.get("id"));
                 r.method = Json.str(m.get("method")).isEmpty() ? "GET" : Json.str(m.get("method"));
                 r.baseUrl = Json.str(m.get("url"));
                 readKvs(m.get("params"), r.params);
@@ -696,6 +764,17 @@ public class StandaloneRestClient {
 
         @SuppressWarnings("unchecked")
         static <T extends Item> T copy(T it) { return (T) item(item(it)); }
+
+        /** Gives every request under {@code it} a new id; a duplicate must not share ids with its original. */
+        static void freshIds(Item it) {
+            if (it instanceof Request r) r.id = UUID.randomUUID().toString();
+            else if (it instanceof Folder f) for (Item child : f.items) freshIds(child);
+        }
+
+        /** True when the two requests would be saved identically; that is what "no unsaved changes" means. */
+        static boolean sameContent(Request a, Request b) {
+            return Json.write(item(a)).equals(Json.write(item(b)));
+        }
     }
 
     // =====================================================================================
@@ -1957,13 +2036,29 @@ public class StandaloneRestClient {
         final JCheckBox insecureBox = new JCheckBox("Ignore SSL errors");
         final JLabel statusBar = new JLabel(" ");
         final javax.swing.Timer saveTimer = new javax.swing.Timer(700, e -> save());
-        /** Debounces re-highlighting so large bodies aren't rescanned on every keystroke. */
-        final javax.swing.Timer highlightTimer = new javax.swing.Timer(150, e -> { if (this.editor != null) this.editor.refreshHighlights(); });
+        /** Debounces re-highlighting and the unsaved-changes check, so large bodies aren't rescanned on every keystroke. */
+        final javax.swing.Timer highlightTimer = new javax.swing.Timer(150, e -> refreshCurrent());
+        /** Keyed by the saved request: it keeps its identity while the tab's draft is edited and saved. */
         final Map<Request, Response> results = new HashMap<>();
         final Map<Request, CompletableFuture<Response>> inFlight = new HashMap<>();
-        RequestEditor editor;
+        /** Open tabs in strip order: openTabs.get(i) is tab i of the strip. */
+        final List<RequestTab> openTabs = new ArrayList<>();
+        /** Only the tab row; the editors live in {@link #editors}, so the ▾ button can sit next to the row. */
+        final JTabbedPane strip = new JTabbedPane(JTabbedPane.TOP, JTabbedPane.SCROLL_TAB_LAYOUT) {
+            @Override public void paint(Graphics g) {
+                super.paint(g);
+                paintDropMarker(g);
+            }
+        };
+        final JPanel editors = new JPanel(new CardLayout());
+        final JPanel editorArea = new JPanel(new CardLayout());
+        final StripMouse stripMouse = new StripMouse();
         ResponseView responseView;
-        DefaultMutableTreeNode currentNode;
+        /** Set while tabs or the tree selection are changed programmatically, so the two don't echo each other. */
+        boolean switching;
+        int tabCounter;
+        /** Where a dragged tab would land, or -1 when no tab is being dragged. */
+        int dropIndex = -1;
         boolean updatingEnvCombo;
         String lastSaveError;
         File lastDir;
@@ -1997,7 +2092,6 @@ public class StandaloneRestClient {
         void start() {
             saveTimer.setRepeats(false);
             highlightTimer.setRepeats(false);
-            editor = new RequestEditor();
             responseView = new ResponseView();
 
             JToolBar tb = new JToolBar();
@@ -2030,6 +2124,17 @@ public class StandaloneRestClient {
             tree.addMouseListener(new MouseAdapter() {
                 @Override public void mousePressed(MouseEvent e) { maybePopup(e); }
                 @Override public void mouseReleased(MouseEvent e) { maybePopup(e); }
+                @Override public void mouseClicked(MouseEvent e) {
+                    if (!SwingUtilities.isLeftMouseButton(e)) return;
+                    TreePath p = tree.getPathForLocation(e.getX(), e.getY());
+                    // Also on a single click: the selection doesn't change when its tab was closed meanwhile.
+                    if (p != null && ((DefaultMutableTreeNode) p.getLastPathComponent()).getUserObject() instanceof Request)
+                        openTab((DefaultMutableTreeNode) p.getLastPathComponent(), e.getClickCount() < 2);
+                }
+            });
+            bind(tree, "ENTER", () -> {
+                DefaultMutableTreeNode n = selectedNode();
+                if (n != null && n.getUserObject() instanceof Request) openTab(n, false);
             });
             bind(tree, "DELETE", () -> { if (selectedNode() != null) delete(selectedNode()); });
             bind(tree, "F2", () -> { if (selectedNode() != null) rename(selectedNode()); });
@@ -2046,7 +2151,7 @@ public class StandaloneRestClient {
                 changed();
             });
 
-            JSplitPane right = new JSplitPane(JSplitPane.VERTICAL_SPLIT, editor.panel, responseView.panel);
+            JSplitPane right = new JSplitPane(JSplitPane.VERTICAL_SPLIT, buildEditorArea(), responseView.panel);
             right.setResizeWeight(0.45);
             right.setContinuousLayout(true);
             JScrollPane treeScroll = new JScrollPane(tree);
@@ -2067,6 +2172,16 @@ public class StandaloneRestClient {
             });
             frame.getRootPane().registerKeyboardAction(e -> sendOrCancel(),
                     KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, InputEvent.CTRL_DOWN_MASK), JComponent.WHEN_IN_FOCUSED_WINDOW);
+            frame.getRootPane().registerKeyboardAction(e -> { if (current() != null) saveTab(current()); },
+                    KeyStroke.getKeyStroke("control S"), JComponent.WHEN_IN_FOCUSED_WINDOW);
+            frame.getRootPane().registerKeyboardAction(e -> saveAll(),
+                    KeyStroke.getKeyStroke("control shift S"), JComponent.WHEN_IN_FOCUSED_WINDOW);
+            frame.getRootPane().registerKeyboardAction(e -> { if (current() != null) closeTab(current()); },
+                    KeyStroke.getKeyStroke("control W"), JComponent.WHEN_IN_FOCUSED_WINDOW);
+            // Ctrl+Tab is a focus-traversal key and Ctrl+PgUp/PgDn belong to the inner tabbed panes and tables,
+            // so ordinary key bindings never see them; a dispatcher runs before both.
+            KeyboardFocusManager.getCurrentKeyboardFocusManager().addKeyEventDispatcher(this::tabSwitchKey);
+            restoreTabs();
             restoreBounds();
             frame.setVisible(true);
             SwingUtilities.invokeLater(() -> right.setDividerLocation(0.45));
@@ -2088,10 +2203,11 @@ public class StandaloneRestClient {
             return b;
         }
 
-        static void menuItem(JPopupMenu m, String text, Runnable r) {
+        static JMenuItem menuItem(JPopupMenu m, String text, Runnable r) {
             JMenuItem it = new JMenuItem(text);
             it.addActionListener(e -> r.run());
             m.add(it);
+            return it;
         }
 
         static void bind(JComponent c, String key, Runnable r) {
@@ -2107,9 +2223,9 @@ public class StandaloneRestClient {
         /** Past this size a body is not scanned; the highlights are a convenience, not worth a stall. */
         static final int MAX_HIGHLIGHT_CHARS = 2_000_000;
 
-        /** The variables the selected request would be sent with. */
-        VarLookup lookup() {
-            return new VarLookup(currentNode == null ? null : collectionOf(currentNode), ws.activeEnv());
+        /** The variables the request at this node would be sent with. */
+        VarLookup lookup(DefaultMutableTreeNode n) {
+            return new VarLookup(n == null ? null : collectionOf(n), ws.activeEnv());
         }
 
         /** Replaces this component's variable highlights; the selection and other highlights are left alone. */
@@ -2215,12 +2331,13 @@ public class StandaloneRestClient {
         void changed() {
             saveTimer.restart();
             highlightTimer.restart(); // also covers environment switches and variable edits, which all come through here
-            if (editor != null) editor.refreshCurl();
+            if (current() != null) current().editor.refreshCurl();
         }
 
         void save() {
             saveTimer.stop();
             if (saveDisabled) return;
+            syncSession();
             try {
                 Storage.save(ws, file);
                 statusBar.setText("Saved " + file);
@@ -2235,8 +2352,9 @@ public class StandaloneRestClient {
             }
         }
 
+        /** Unsaved drafts are kept with the session rather than asked about, so exiting never prompts. */
         void exit() {
-            editor.commit();
+            commitAll();
             boolean max = (frame.getExtendedState() & Frame.MAXIMIZED_BOTH) == Frame.MAXIMIZED_BOTH;
             Rectangle b = frame.getBounds();
             if (max && ws.window != null && ws.window.length >= 4)
@@ -2302,17 +2420,19 @@ public class StandaloneRestClient {
             return parent == root ? (List<Item>) (List<?>) ws.collections : ((Folder) parent.getUserObject()).items;
         }
 
+        /** Selecting a request (click or arrow keys) previews it; folders leave the tabs alone. */
         void selectionChanged() {
-            editor.commit();
+            if (switching) return;
             DefaultMutableTreeNode n = selectedNode();
-            currentNode = n;
-            if (n != null && n.getUserObject() instanceof Request r) {
-                editor.load(r, breadcrumb(n));
-                responseView.show(results.get(r), inFlight.containsKey(r));
-            } else {
-                editor.showEmpty();
-                responseView.show(null, false);
+            if (n != null && n.getUserObject() instanceof Request) openTab(n, true);
+        }
+
+        DefaultMutableTreeNode nodeFor(String requestId) {
+            for (Enumeration<TreeNode> e = root.depthFirstEnumeration(); e.hasMoreElements(); ) {
+                DefaultMutableTreeNode n = (DefaultMutableTreeNode) e.nextElement();
+                if (n.getUserObject() instanceof Request r && r.id.equals(requestId)) return n;
             }
+            return null;
         }
 
         void maybePopup(MouseEvent e) {
@@ -2398,13 +2518,20 @@ public class StandaloneRestClient {
             if (name == null || name.equals(it.name)) return;
             it.name = name;
             treeModel.nodeChanged(n);
-            if (n == currentNode) editor.breadcrumb.setText(breadcrumb(n));
+            for (RequestTab t : openTabs) {
+                if (t.saved == it) t.draft.name = name; // rename isn't buffered, so it must not look like an unsaved change
+                if (n.isNodeDescendant(t.node)) {
+                    t.updateHeader();
+                    t.editor.breadcrumb.setText(breadcrumb(t.node));
+                }
+            }
             changed();
         }
 
         void duplicate(DefaultMutableTreeNode n) {
             Item it = (Item) n.getUserObject();
-            Item copy = Storage.copy(it);
+            Item copy = Storage.copy(it); // the saved version: unsaved edits in an open tab stay in that tab
+            Storage.freshIds(copy);
             copy.name = it.name + " Copy";
             List<Item> list = siblings(n);
             int idx = list.indexOf(it) + 1;
@@ -2434,7 +2561,21 @@ public class StandaloneRestClient {
         void delete(DefaultMutableTreeNode n) {
             Item it = (Item) n.getUserObject();
             String what = it instanceof Request ? "request" : it instanceof Collection ? "collection" : "folder";
-            if (!confirm("Delete " + what + " '" + it.name + "'?")) return;
+            List<RequestTab> affected = openTabs.stream().filter(t -> n.isNodeDescendant(t.node)).toList();
+            boolean unsaved = false;
+            for (RequestTab t : affected) {
+                t.editor.commit();
+                updateDirty(t);
+                unsaved |= t.dirty;
+            }
+            if (!confirm("Delete " + what + " '" + it.name + "'?"
+                    + (unsaved ? "\n\nIts open tab has unsaved changes, which will be discarded." : ""))) return;
+            for (RequestTab t : affected) {
+                CompletableFuture<Response> f = inFlight.remove(t.saved);
+                if (f != null) f.cancel(true);
+                results.remove(t.saved);
+                removeTab(t);
+            }
             siblings(n).remove(it);
             treeModel.removeNodeFromParent(n);
             changed();
@@ -2448,8 +2589,10 @@ public class StandaloneRestClient {
                 if (o instanceof Request r) {
                     setIcon(null);
                     String m = html(r.method);
+                    RequestTab tab = tabFor(r);
+                    String dot = tab != null && tab.dirty ? "&nbsp;" + (sel ? "●" : "<font color='gray'>●</font>") : "";
                     setText("<html><b>" + (sel ? m : "<font color='" + methodColor(r.method) + "'>" + m + "</font>")
-                            + "</b>&nbsp;" + html(r.name) + "</html>"); // coloured text is unreadable on the selection colour
+                            + "</b>&nbsp;" + html(r.name) + dot + "</html>"); // coloured text is unreadable on the selection colour
                 } else if (o instanceof Collection c) {
                     setIcon(exp ? getOpenIcon() : getClosedIcon());
                     setText("<html><b>" + html(c.name) + "</b></html>");
@@ -2489,7 +2632,7 @@ public class StandaloneRestClient {
         }
 
         void manageEnvironments() {
-            editor.commit();
+            commitAll();
             JDialog d = new JDialog(frame, "Environments", true);
             d.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
             DefaultListModel<Environment> model = new DefaultListModel<>();
@@ -2663,35 +2806,39 @@ public class StandaloneRestClient {
 
         // ---------------------------------------------------------------- sending
 
+        /** Sends the tab's draft: what you see is what is sent, saved or not. */
         void sendOrCancel() {
-            Request r = editor.req;
-            if (r == null) return;
-            CompletableFuture<Response> running = inFlight.get(r);
+            RequestTab t = current();
+            if (t == null) return;
+            CompletableFuture<Response> running = inFlight.get(t.saved);
             if (running != null) { running.cancel(true); return; }
-            editor.commit();
-            Collection c = collectionOf(currentNode);
+            t.editor.commit();
+            pin(t);
+            Collection c = collectionOf(t.node);
             Environment env = ws.activeEnv();
             Engine.Prepared p;
             try {
-                p = Engine.prepare(r, Engine.variables(c, env));
+                p = Engine.prepare(t.draft, Engine.variables(c, env));
             } catch (IllegalArgumentException e) {
                 Response failed = Response.failed("", e.getMessage(), List.of());
-                results.put(r, failed);
+                results.put(t.saved, failed);
                 responseView.show(failed, false);
                 return;
             }
             CompletableFuture<Response> f = Engine.send(p, ws.settings);
-            inFlight.put(r, f);
-            editor.updateSendButton();
+            inFlight.put(t.saved, f);
+            t.editor.updateSendButton();
             responseView.show(null, true);
-            f.whenComplete((res, ex) -> SwingUtilities.invokeLater(() -> finished(r, c, env, p, res, ex)));
+            f.whenComplete((res, ex) -> SwingUtilities.invokeLater(() -> finished(t, f, c, env, p, res, ex)));
         }
 
-        void finished(Request r, Collection c, Environment env, Engine.Prepared p, Response res, Throwable ex) {
-            inFlight.remove(r);
+        void finished(RequestTab t, CompletableFuture<Response> f, Collection c, Environment env, Engine.Prepared p,
+                      Response res, Throwable ex) {
+            // Not in the map any more: its tab was closed (or its request deleted) and nobody is waiting for it.
+            if (!inFlight.remove(t.saved, f)) return;
             Response shown;
             if (res != null) {
-                List<String> log = Engine.applyPostActions(r, res, c, env);
+                List<String> log = Engine.applyPostActions(t.draft, res, c, env);
                 res.messages.addAll(log);
                 if (!log.isEmpty()) changed();
                 shown = res;
@@ -2702,21 +2849,542 @@ public class StandaloneRestClient {
                             + "\ncertificate, tick \"Ignore SSL errors\" in the toolbar (like curl -k) and send again.";
                 shown = Response.failed(p.summary(), error, p.messages);
             }
-            results.put(r, shown);
-            if (editor.req == r) {
-                responseView.show(shown, false);
-                editor.updateSendButton();
+            results.put(t.saved, shown);
+            t.editor.updateSendButton();
+            if (current() == t) responseView.show(shown, false);
+        }
+
+        // ---------------------------------------------------------------- request tabs
+
+        /**
+         * One open request. The editor edits {@link #draft}, a copy of {@link #saved} (the workspace object):
+         * changes reach the workspace only on Save, and each tab keeps its own undo history and view state.
+         */
+        final class RequestTab {
+            final DefaultMutableTreeNode node;
+            final Request saved;
+            final Request draft;
+            final JPanel placeholder = new JPanel();
+            final String card = "tab" + (++tabCounter);
+            final JPanel header = new JPanel(new BorderLayout(6, 0));
+            final JLabel label = new JLabel();
+            final JButton close = new JButton("×");
+            /** A preview tab is replaced by the next request opened from the tree, until it is edited or pinned. */
+            boolean preview;
+            boolean dirty;
+            boolean hover;
+            final RequestEditor editor;
+
+            RequestTab(DefaultMutableTreeNode node, Request draft, boolean preview) {
+                this.node = node;
+                this.saved = (Request) node.getUserObject();
+                this.draft = draft;
+                this.preview = preview;
+                this.dirty = !Storage.sameContent(draft, saved);
+                placeholder.setPreferredSize(new Dimension(0, 0));
+                header.setOpaque(false);
+                close.setMargin(new Insets(0, 2, 0, 2));
+                close.setBorder(BorderFactory.createEmptyBorder(0, 2, 0, 0));
+                close.setContentAreaFilled(false);
+                close.setFocusable(false);
+                close.setToolTipText("Close (Ctrl+W)");
+                close.addActionListener(e -> closeTab(this));
+                close.addMouseListener(new MouseAdapter() {
+                    @Override public void mouseEntered(MouseEvent e) { hover = true; updateHeader(); }
+                    @Override public void mouseExited(MouseEvent e) { hover = false; updateHeader(); }
+                });
+                header.add(label, BorderLayout.CENTER);
+                header.add(close, BorderLayout.EAST);
+                for (JComponent c : List.of(header, label)) {
+                    c.addMouseListener(stripMouse);
+                    c.addMouseMotionListener(stripMouse);
+                }
+                editor = new RequestEditor(this);
+                updateHeader();
             }
+
+            void updateHeader() {
+                String text = "<b><font color='" + methodColor(draft.method) + "'>" + html(draft.method) + "</font></b>&nbsp;"
+                        + html(abbreviate(saved.name, 40));
+                label.setText("<html>" + (preview ? "<i>" + text + "</i>" : text) + "</html>");
+                label.setToolTipText(breadcrumb(node) + (dirty ? "  (unsaved changes)" : "")
+                        + (preview ? "  (preview: opening another request replaces it; double-click to keep it)" : ""));
+                close.setText(dirty && !hover ? "●" : "×");
+            }
+        }
+
+        JComponent buildEditorArea() {
+            strip.setFocusable(false);
+            strip.addChangeListener(e -> { if (!switching) showSelected(); });
+            strip.addMouseListener(stripMouse);
+            strip.addMouseMotionListener(stripMouse);
+            // Clicks between tab components land on the strip's internal tab panel.
+            if (stripViewport() != null && stripViewport().getView() instanceof JComponent view) {
+                view.addMouseListener(stripMouse);
+                view.addMouseMotionListener(stripMouse);
+            }
+            strip.addMouseWheelListener(e -> scrollStrip(e.getWheelRotation() * 48));
+            JButton list = new JButton("▾");
+            list.setMargin(new Insets(0, 6, 0, 6));
+            list.setFocusable(false);
+            list.setToolTipText("All open tabs");
+            list.addActionListener(e -> showTabList(list));
+            JPanel row = new JPanel(new BorderLayout());
+            row.add(strip, BorderLayout.CENTER);
+            row.add(list, BorderLayout.EAST);
+            JPanel tabs = new JPanel(new BorderLayout());
+            tabs.add(row, BorderLayout.NORTH);
+            tabs.add(editors, BorderLayout.CENTER);
+            JLabel empty = new JLabel("<html><center>Click a request in the tree to open it, or use New Request / Import to get started."
+                    + "<br><br><font color='gray'>A single click opens a preview tab, which the next click reuses; "
+                    + "double-click or edit to keep it open.</font></center></html>", SwingConstants.CENTER);
+            empty.setForeground(Color.GRAY);
+            editorArea.add(empty, "empty");
+            editorArea.add(tabs, "tabs");
+            editorArea.setMinimumSize(new Dimension(300, 150));
+            return editorArea;
+        }
+
+        RequestTab current() {
+            int i = strip.getSelectedIndex();
+            return i < 0 || i >= openTabs.size() ? null : openTabs.get(i);
+        }
+
+        RequestTab tabFor(Request saved) {
+            for (RequestTab t : openTabs) if (t.saved == saved) return t;
+            return null;
+        }
+
+        /** Focuses the request's tab, opening it first if needed; a preview reuses the current preview tab. */
+        RequestTab openTab(DefaultMutableTreeNode n, boolean preview) {
+            Request r = (Request) n.getUserObject();
+            RequestTab t = tabFor(r);
+            if (t == null) {
+                RequestTab old = null;
+                if (preview) for (RequestTab x : openTabs) if (x.preview && !x.dirty && !inFlight.containsKey(x.saved)) old = x;
+                t = new RequestTab(n, Storage.copy(r), preview);
+                addTab(t, old != null ? openTabs.indexOf(old) : openTabs.size());
+                if (old != null) removeTab(old);
+            } else if (!preview) {
+                pin(t);
+            }
+            selectTab(t);
+            return t;
+        }
+
+        void addTab(RequestTab t, int index) {
+            switching = true;
+            try {
+                openTabs.add(index, t);
+                strip.insertTab("", null, t.placeholder, null, index);
+                strip.setTabComponentAt(index, t.header);
+                editors.add(t.editor.panel, t.card);
+            } finally {
+                switching = false;
+            }
+            saveTimer.restart();
+        }
+
+        /** Removes the tab without asking; {@link #closeTab} is the user-facing close. */
+        void removeTab(RequestTab t) {
+            int i = openTabs.indexOf(t);
+            if (i < 0) return;
+            switching = true;
+            try {
+                openTabs.remove(i);
+                strip.removeTabAt(i);
+                editors.remove(t.editor.panel);
+            } finally {
+                switching = false;
+            }
+            showSelected();
+            treeModel.nodeChanged(t.node); // drops its unsaved-changes dot
+            saveTimer.restart();
+        }
+
+        void selectTab(RequestTab t) {
+            int i = openTabs.indexOf(t);
+            if (i < 0) return;
+            if (strip.getSelectedIndex() != i) strip.setSelectedIndex(i); // the change listener shows it
+            else showSelected();
+        }
+
+        void showSelected() {
+            RequestTab t = current();
+            CardLayout area = (CardLayout) editorArea.getLayout();
+            if (t == null) {
+                area.show(editorArea, "empty");
+                responseView.show(null, false);
+                return;
+            }
+            ((CardLayout) editors.getLayout()).show(editors, t.card);
+            area.show(editorArea, "tabs");
+            responseView.show(results.get(t.saved), inFlight.containsKey(t.saved));
+            t.editor.shown();
+            revealInTree(t);
+            saveTimer.restart(); // the selected tab is part of the session
+        }
+
+        void revealInTree(RequestTab t) {
+            if (t.node.getRoot() != root) return;
+            switching = true;
+            try {
+                select(t.node);
+            } finally {
+                switching = false;
+            }
+        }
+
+        void pin(RequestTab t) {
+            if (!t.preview) return;
+            t.preview = false;
+            t.updateHeader();
+        }
+
+        /** Called by a tab's editor for every change to its draft. */
+        void draftEdited(RequestTab t) {
+            pin(t);
+            saveTimer.restart(); // the draft is saved with the session, so a crash loses nothing
+            highlightTimer.restart();
+            t.editor.refreshCurl();
+        }
+
+        void refreshCurrent() {
+            RequestTab t = current();
+            if (t == null) return;
+            t.editor.refreshHighlights();
+            updateDirty(t);
+        }
+
+        void updateDirty(RequestTab t) {
+            boolean d = !Storage.sameContent(t.draft, t.saved);
+            if (d == t.dirty) return;
+            t.dirty = d;
+            t.updateHeader();
+            t.editor.updateSaveButton();
+            if (t.node.getRoot() == root) treeModel.nodeChanged(t.node);
+        }
+
+        void commitAll() {
+            for (RequestTab t : openTabs) t.editor.commit();
+        }
+
+        void saveTab(RequestTab t) {
+            t.editor.commit();
+            t.saved.copyFrom(t.draft);
+            t.dirty = false;
+            t.updateHeader();
+            t.editor.updateSaveButton();
+            treeModel.nodeChanged(t.node);
+            save();
+        }
+
+        void saveAll() {
+            commitAll();
+            for (RequestTab t : openTabs) {
+                updateDirty(t);
+                if (t.dirty) {
+                    t.saved.copyFrom(t.draft);
+                    t.dirty = false;
+                    t.updateHeader();
+                    t.editor.updateSaveButton();
+                    treeModel.nodeChanged(t.node);
+                }
+            }
+            save();
+        }
+
+        void revertTab(RequestTab t) {
+            t.editor.commit();
+            updateDirty(t);
+            if (!t.dirty || !confirm("Discard the unsaved changes to '" + t.saved.name + "'?")) return;
+            t.draft.copyFrom(t.saved);
+            t.editor.load();
+            updateDirty(t);
+            t.updateHeader();
+            saveTimer.restart();
+        }
+
+        /** Asks before discarding unsaved changes; false when the user cancelled. */
+        boolean closeTab(RequestTab t) {
+            t.editor.commit();
+            updateDirty(t);
+            if (t.dirty) {
+                selectTab(t);
+                Object[] options = {"Save", "Don't Save", "Cancel"};
+                int a = JOptionPane.showOptionDialog(frame, "Save the changes to '" + t.saved.name + "'?", APP,
+                        JOptionPane.YES_NO_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE, null, options, options[0]);
+                if (a == 0) saveTab(t);
+                else if (a != 1) return false;
+            }
+            CompletableFuture<Response> f = inFlight.remove(t.saved);
+            if (f != null) f.cancel(true);
+            removeTab(t);
+            return true;
+        }
+
+        void closeTabs(List<RequestTab> tabs) {
+            for (RequestTab t : List.copyOf(tabs)) if (!closeTab(t)) return;
+        }
+
+        void cycleTab(int delta) {
+            int n = openTabs.size(), i = strip.getSelectedIndex();
+            if (n > 1 && i >= 0) strip.setSelectedIndex((i + delta + n) % n);
+        }
+
+        boolean tabSwitchKey(KeyEvent e) {
+            if (e.getID() != KeyEvent.KEY_PRESSED || !e.isControlDown() || e.isAltDown() || e.isMetaDown()) return false;
+            if (KeyboardFocusManager.getCurrentKeyboardFocusManager().getFocusedWindow() != frame) return false;
+            int delta = switch (e.getKeyCode()) {
+                case KeyEvent.VK_TAB -> e.isShiftDown() ? -1 : 1;
+                case KeyEvent.VK_PAGE_DOWN -> e.isShiftDown() ? 0 : 1;
+                case KeyEvent.VK_PAGE_UP -> e.isShiftDown() ? 0 : -1;
+                default -> 0;
+            };
+            if (delta == 0) return false;
+            cycleTab(delta);
+            return true;
+        }
+
+        JPopupMenu tabMenu(RequestTab t) {
+            JPopupMenu m = new JPopupMenu();
+            menuItem(m, "Save  (Ctrl+S)", () -> saveTab(t)).setEnabled(t.dirty);
+            menuItem(m, "Revert Changes", () -> revertTab(t)).setEnabled(t.dirty);
+            if (t.preview) menuItem(m, "Keep Open", () -> pin(t));
+            m.addSeparator();
+            int i = openTabs.indexOf(t);
+            menuItem(m, "Close  (Ctrl+W)", () -> closeTab(t));
+            menuItem(m, "Close Others", () -> closeTabs(openTabs.stream().filter(x -> x != t).toList())).setEnabled(openTabs.size() > 1);
+            menuItem(m, "Close to the Right", () -> closeTabs(openTabs.subList(i + 1, openTabs.size()))).setEnabled(i < openTabs.size() - 1);
+            menuItem(m, "Close Saved", () -> {
+                commitAll();
+                openTabs.forEach(this::updateDirty);
+                closeTabs(openTabs.stream().filter(x -> !x.dirty).toList());
+            });
+            m.addSeparator();
+            menuItem(m, "Reveal in Tree", () -> {
+                revealInTree(t);
+                tree.requestFocusInWindow();
+            });
+            return m;
+        }
+
+        /** The ▾ list: every open tab, filtered by typing, for when the strip has more than fits. */
+        void showTabList(JComponent anchor) {
+            JPopupMenu pop = new JPopupMenu();
+            JTextField filter = new JTextField(28);
+            DefaultListModel<RequestTab> model = new DefaultListModel<>();
+            JList<RequestTab> list = new JList<>(model);
+            list.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+            list.setCellRenderer(new DefaultListCellRenderer() {
+                @Override public Component getListCellRendererComponent(JList<?> l, Object value, int index, boolean sel, boolean focus) {
+                    super.getListCellRendererComponent(l, value, index, sel, focus);
+                    RequestTab t = (RequestTab) value;
+                    String m = html(t.draft.method);
+                    String text = "<b>" + (sel ? m : "<font color='" + methodColor(t.draft.method) + "'>" + m + "</font>") + "</b>&nbsp;"
+                            + html(t.saved.name) + (t.dirty ? " ●" : "")
+                            + "&nbsp;&nbsp;<font color='" + (sel ? "white" : "gray") + "'>" + html(breadcrumb(t.node)) + "</font>";
+                    setText("<html><nobr>" + (t.preview ? "<i>" + text + "</i>" : text) + "</nobr></html>");
+                    return this;
+                }
+            });
+            Runnable refill = () -> {
+                String q = filter.getText().trim().toLowerCase(Locale.ROOT);
+                model.clear();
+                for (RequestTab t : openTabs)
+                    if (q.isEmpty() || (t.draft.method + " " + breadcrumb(t.node)).toLowerCase(Locale.ROOT).contains(q)) model.addElement(t);
+                int cur = model.indexOf(current());
+                if (!model.isEmpty()) list.setSelectedIndex(q.isEmpty() && cur >= 0 ? cur : 0);
+                list.ensureIndexIsVisible(list.getSelectedIndex());
+            };
+            Runnable go = () -> {
+                RequestTab t = list.getSelectedValue();
+                pop.setVisible(false);
+                if (t != null) selectTab(t);
+            };
+            onTextChange(filter, refill);
+            filter.addActionListener(e -> go.run());
+            bind(filter, "DOWN", () -> list.setSelectedIndex(Math.min(model.size() - 1, list.getSelectedIndex() + 1)));
+            bind(filter, "UP", () -> list.setSelectedIndex(Math.max(0, list.getSelectedIndex() - 1)));
+            list.addListSelectionListener(e -> list.ensureIndexIsVisible(list.getSelectedIndex()));
+            list.addMouseListener(new MouseAdapter() {
+                @Override public void mouseReleased(MouseEvent e) { go.run(); }
+            });
+            list.setVisibleRowCount(Math.max(1, Math.min(15, openTabs.size())));
+            refill.run();
+            JPanel p = new JPanel(new BorderLayout(0, 4));
+            p.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
+            p.add(filter, BorderLayout.NORTH);
+            p.add(new JScrollPane(list), BorderLayout.CENTER);
+            pop.add(p);
+            Dimension size = pop.getPreferredSize();
+            int width = Math.min(Math.max(size.width, 360), 640);
+            pop.setPopupSize(width, size.height);
+            pop.show(anchor, anchor.getWidth() - width, anchor.getHeight());
+            filter.requestFocusInWindow();
+        }
+
+        /** The viewport the scrolling tab layout puts the tab row in; null for other layouts. */
+        JViewport stripViewport() {
+            for (Component c : strip.getComponents()) if (c instanceof JViewport v) return v;
+            return null;
+        }
+
+        /** Swing only scrolls the tab row with its arrow buttons; this adds the mouse wheel and drag auto-scroll. */
+        void scrollStrip(int dx) {
+            JViewport vp = stripViewport();
+            if (vp == null || vp.getView() == null) return;
+            int max = Math.max(0, vp.getView().getWidth() - vp.getWidth());
+            Point pos = vp.getViewPosition();
+            int x = Math.max(0, Math.min(max, pos.x + dx));
+            if (x != pos.x) {
+                vp.setViewPosition(new Point(x, pos.y));
+                strip.repaint();
+            }
+        }
+
+        /** Index the dragged tab would be inserted at, for a point in strip coordinates. */
+        int dropIndexAt(int x) {
+            for (int i = 0; i < strip.getTabCount(); i++) {
+                Rectangle r = strip.getBoundsAt(i);
+                if (r != null && x < r.x + r.width / 2) return i;
+            }
+            return strip.getTabCount();
+        }
+
+        void paintDropMarker(Graphics g) {
+            int n = strip.getTabCount();
+            if (dropIndex < 0 || n == 0) return;
+            Rectangle r = strip.getBoundsAt(Math.min(dropIndex, n - 1));
+            if (r == null) return;
+            int x = dropIndex < n ? r.x : r.x + r.width;
+            Graphics2D g2 = (Graphics2D) g.create();
+            JViewport vp = stripViewport();
+            if (vp != null) g2.clipRect(vp.getX(), vp.getY(), vp.getWidth(), vp.getHeight());
+            g2.setColor(new Color(0x1565c0));
+            g2.fillRect(x - 1, r.y, 3, r.height);
+            g2.dispose();
+        }
+
+        void moveTab(int from, int to) {
+            if (to == from || to == from + 1) return;
+            RequestTab t = openTabs.get(from);
+            int index = to > from ? to - 1 : to;
+            switching = true;
+            try {
+                openTabs.remove(from);
+                strip.removeTabAt(from);
+                openTabs.add(index, t);
+                strip.insertTab("", null, t.placeholder, null, index);
+                strip.setTabComponentAt(index, t.header);
+                strip.setSelectedIndex(index);
+            } finally {
+                switching = false;
+            }
+            showSelected();
+        }
+
+        /**
+         * Clicks, middle-click close, double-click pin, the context menu and drag-to-reorder. It listens on the
+         * strip and on every tab header, because a header with a tooltip receives the clicks on its tab itself.
+         */
+        final class StripMouse extends MouseAdapter {
+            int pressIndex = -1;
+            Point pressPoint;
+            boolean dragging;
+            int scrollDir;
+            int lastX;
+            final javax.swing.Timer autoScroll = new javax.swing.Timer(40, e -> {
+                scrollStrip(scrollDir * 16);
+                if (pressPoint != null) { dropIndex = dropIndexAt(lastX); strip.repaint(); }
+            });
+
+            Point toStrip(MouseEvent e) { return SwingUtilities.convertPoint(e.getComponent(), e.getPoint(), strip); }
+
+            @Override public void mousePressed(MouseEvent e) {
+                Point p = toStrip(e);
+                int i = strip.indexAtLocation(p.x, p.y);
+                if (i < 0) return;
+                strip.setSelectedIndex(i);
+                if (e.isPopupTrigger()) { tabMenu(openTabs.get(i)).show(strip, p.x, p.y); return; }
+                if (SwingUtilities.isLeftMouseButton(e)) {
+                    pressIndex = i;
+                    pressPoint = p;
+                }
+            }
+
+            @Override public void mouseDragged(MouseEvent e) {
+                if (pressIndex < 0 || pressPoint == null) return;
+                Point p = toStrip(e);
+                if (!dragging && Math.abs(p.x - pressPoint.x) < 6) return;
+                dragging = true;
+                lastX = p.x;
+                dropIndex = dropIndexAt(p.x);
+                JViewport vp = stripViewport();
+                scrollDir = vp == null ? 0 : p.x < vp.getX() + 20 ? -1 : p.x > vp.getX() + vp.getWidth() - 20 ? 1 : 0;
+                if (scrollDir != 0) autoScroll.start(); else autoScroll.stop();
+                strip.repaint();
+            }
+
+            @Override public void mouseReleased(MouseEvent e) {
+                autoScroll.stop();
+                int from = pressIndex, to = dropIndex;
+                boolean moved = dragging;
+                pressIndex = -1;
+                pressPoint = null;
+                dragging = false;
+                dropIndex = -1;
+                strip.repaint();
+                if (moved && from >= 0 && to >= 0) { moveTab(from, to); return; }
+                Point p = toStrip(e);
+                int i = strip.indexAtLocation(p.x, p.y);
+                if (i >= 0 && e.isPopupTrigger()) tabMenu(openTabs.get(i)).show(strip, p.x, p.y);
+            }
+
+            @Override public void mouseClicked(MouseEvent e) {
+                Point p = toStrip(e);
+                int i = strip.indexAtLocation(p.x, p.y);
+                if (i < 0) return;
+                if (SwingUtilities.isMiddleMouseButton(e)) closeTab(openTabs.get(i));
+                else if (SwingUtilities.isLeftMouseButton(e) && e.getClickCount() == 2) pin(openTabs.get(i));
+            }
+        }
+
+        /** Copies the open tabs (and their unsaved drafts) into the workspace, so they come back after a restart. */
+        void syncSession() {
+            ws.openTabs.clear();
+            for (RequestTab t : openTabs)
+                ws.openTabs.add(new OpenTab(t.saved.id, t.preview, Storage.sameContent(t.draft, t.saved) ? null : t.draft));
+            ws.selectedTab = current() == null ? "" : current().saved.id;
+        }
+
+        void restoreTabs() {
+            RequestTab selected = null;
+            for (OpenTab o : ws.openTabs) {
+                DefaultMutableTreeNode n = nodeFor(o.requestId());
+                if (n == null || tabFor((Request) n.getUserObject()) != null) continue; // deleted, or listed twice
+                Request saved = (Request) n.getUserObject();
+                Request draft = Storage.copy(saved);
+                if (o.draft() != null) draft.copyFrom(o.draft());
+                RequestTab t = new RequestTab(n, draft, o.preview());
+                addTab(t, openTabs.size());
+                if (saved.id.equals(ws.selectedTab)) selected = t;
+            }
+            if (selected == null && !openTabs.isEmpty()) selected = openTabs.get(0);
+            if (selected != null) selectTab(selected);
+            else showSelected();
         }
 
         // ---------------------------------------------------------------- request editor
 
         final class RequestEditor {
-            final JPanel panel = new JPanel(new CardLayout());
+            final RequestTab tab;
+            final JPanel panel = new JPanel(new BorderLayout());
             final JLabel breadcrumb = new JLabel(" ");
+            final JButton save = new JButton("Save");
             final JComboBox<String> method = new JComboBox<>(METHODS);
             final JTextField url = new JTextField() {
-                @Override public String getToolTipText(MouseEvent e) { return varTipAt(this, e, lookup()); }
+                @Override public String getToolTipText(MouseEvent e) { return varTipAt(this, e, vars()); }
             };
             final JButton send = new JButton("Send");
             final KvTable params = new KvTable("Key", "Value", this::paramsChanged);
@@ -2730,7 +3398,7 @@ public class StandaloneRestClient {
             final JPanel bodyCards = new JPanel(new CardLayout());
             final JButton format = new JButton("Format JSON");
             final JTextArea body = new JTextArea() {
-                @Override public String getToolTipText(MouseEvent e) { return varTipAt(this, e, lookup()); }
+                @Override public String getToolTipText(MouseEvent e) { return varTipAt(this, e, vars()); }
             };
             final UndoManager undo = new UndoManager();
             final UndoManager urlUndo = new UndoManager();
@@ -2741,17 +3409,20 @@ public class StandaloneRestClient {
             final JCheckBox curlVerbose = new JCheckBox("Verbose (-v)");
             final JCheckBox curlMultiline = new JCheckBox("Multi-line");
             JPanel curlPanel;
-            Request req;
+            /** The tab's draft; never the workspace's request. */
+            final Request req;
             boolean loading, syncing;
 
-            RequestEditor() {
+            RequestEditor(RequestTab tab) {
+                this.tab = tab;
+                this.req = tab.draft;
                 method.setEditable(true);
                 method.setPrototypeDisplayValue("OPTIONS  ");
                 method.addActionListener(e -> methodChanged());
                 url.setFont(MONO);
                 ToolTipManager.sharedInstance().registerComponent(url);
                 ToolTipManager.sharedInstance().registerComponent(body);
-                for (KvTable t : List.of(params, headers, form)) t.highlightVariables(Ui.this::lookup);
+                for (KvTable t : List.of(params, headers, form)) t.highlightVariables(this::vars);
                 onTextChange(url, this::urlChanged);
                 url.getDocument().addUndoableEditListener(e -> {
                     if (loading) return;
@@ -2770,9 +3441,15 @@ public class StandaloneRestClient {
                 line.add(url, BorderLayout.CENTER);
                 line.add(send, BorderLayout.EAST);
                 breadcrumb.setForeground(Color.GRAY);
+                save.setToolTipText("Save this request (Ctrl+S); Ctrl+Shift+S saves all tabs");
+                save.setFocusable(false);
+                save.addActionListener(e -> saveTab(tab));
+                JPanel crumbRow = new JPanel(new BorderLayout(8, 0));
+                crumbRow.add(breadcrumb, BorderLayout.CENTER);
+                crumbRow.add(save, BorderLayout.EAST);
                 JPanel top = new JPanel(new BorderLayout(0, 6));
-                top.setBorder(BorderFactory.createEmptyBorder(8, 8, 6, 8));
-                top.add(breadcrumb, BorderLayout.NORTH);
+                top.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8));
+                top.add(crumbRow, BorderLayout.NORTH);
                 top.add(line, BorderLayout.CENTER);
 
                 ButtonGroup group = new ButtonGroup();
@@ -2784,9 +3461,9 @@ public class StandaloneRestClient {
                 body.setFont(MONO);
                 body.setTabSize(2);
                 onTextChange(body, () -> {
-                    if (loading || req == null) return;
+                    if (loading) return;
                     req.body = body.getText();
-                    changed();
+                    edited();
                 });
                 body.getDocument().addUndoableEditListener(e -> { if (!loading) undo.addEdit(e.getEdit()); });
                 bind(body, "control Z", () -> { if (undo.canUndo()) undo.undo(); });
@@ -2819,21 +3496,22 @@ public class StandaloneRestClient {
                 tabs.addTab("curl", curlPanel());
                 tabs.addChangeListener(e -> refreshCurl());
 
-                JPanel card = new JPanel(new BorderLayout());
-                card.add(top, BorderLayout.NORTH);
-                card.add(tabs, BorderLayout.CENTER);
-                JLabel empty = new JLabel("Select a request, or use New Request / Import to get started.", SwingConstants.CENTER);
-                empty.setForeground(Color.GRAY);
-                panel.add(empty, "empty");
-                panel.add(card, "editor");
+                panel.add(top, BorderLayout.NORTH);
+                panel.add(tabs, BorderLayout.CENTER);
                 panel.setMinimumSize(new Dimension(300, 150));
+                load();
             }
 
-            void load(Request r, String crumb) {
+            VarLookup vars() { return lookup(tab.node); }
+
+            void edited() { draftEdited(tab); }
+
+            /** Fills the controls from the draft; on open and on revert. Undo history starts empty here. */
+            void load() {
+                Request r = req;
                 loading = true;
                 try {
-                    req = r;
-                    breadcrumb.setText(crumb);
+                    breadcrumb.setText(breadcrumb(tab.node));
                     method.setSelectedItem(r.method);
                     url.setText(r.url());
                     url.setCaretPosition(0);
@@ -2857,9 +3535,18 @@ public class StandaloneRestClient {
                 updateBodyControls();
                 updateTabTitles();
                 updateSendButton();
+                updateSaveButton();
                 refreshCurl();
                 refreshHighlights();
-                ((CardLayout) panel.getLayout()).show(panel, "editor");
+            }
+
+            /** The tab became the visible one: catch up on what changed while it was hidden. */
+            void shown() {
+                curlVerbose.setSelected(ws.settings.curlVerbose); // global flags, possibly changed in another tab
+                curlMultiline.setSelected(ws.settings.curlMultiline);
+                updateSendButton();
+                refreshCurl();
+                refreshHighlights();
             }
 
             JPanel curlPanel() {
@@ -2891,8 +3578,7 @@ public class StandaloneRestClient {
             }
 
             void refreshHighlights() {
-                if (req == null) return;
-                VarLookup vars = lookup();
+                VarLookup vars = vars();
                 highlightVars(url, vars);
                 highlightVars(body, vars);
                 params.table.repaint();
@@ -2902,20 +3588,15 @@ public class StandaloneRestClient {
 
             /** Rebuilt only while the tab is visible, so dynamic variables like {{$guid}} don't churn on every keystroke. */
             void refreshCurl() {
-                if (req == null || tabs.getSelectedComponent() != curlPanel) return;
+                if (tabs.getSelectedComponent() != curlPanel) return;
                 String text;
                 try {
-                    text = Engine.curl(Engine.prepare(req, Engine.variables(collectionOf(currentNode), ws.activeEnv())), ws.settings);
+                    text = Engine.curl(Engine.prepare(req, Engine.variables(collectionOf(tab.node), ws.activeEnv())), ws.settings);
                 } catch (IllegalArgumentException e) {
                     text = "# " + e.getMessage();
                 }
                 curl.setText(text);
                 curl.setCaretPosition(0);
-            }
-
-            void showEmpty() {
-                req = null;
-                ((CardLayout) panel.getLayout()).show(panel, "empty");
             }
 
             /** Pushes pending cell edits and a typed-but-unconfirmed method into the model. */
@@ -2924,27 +3605,25 @@ public class StandaloneRestClient {
                 headers.stopEditing();
                 post.stopEditing();
                 form.stopEditing();
-                if (req != null) {
-                    String typed = String.valueOf(method.getEditor().getItem()).trim().toUpperCase(Locale.ROOT);
-                    if (!typed.isEmpty() && !typed.equals(req.method)) {
-                        req.method = typed;
-                        if (currentNode != null) treeModel.nodeChanged(currentNode);
-                        changed();
-                    }
+                String typed = String.valueOf(method.getEditor().getItem()).trim().toUpperCase(Locale.ROOT);
+                if (!typed.isEmpty() && !typed.equals(req.method)) {
+                    req.method = typed;
+                    tab.updateHeader();
+                    edited();
                 }
             }
 
             void methodChanged() {
-                if (loading || req == null) return;
+                if (loading) return;
                 String m = String.valueOf(method.getSelectedItem()).trim().toUpperCase(Locale.ROOT);
                 if (m.isEmpty() || m.equals(req.method)) return;
                 req.method = m;
-                if (currentNode != null) treeModel.nodeChanged(currentNode);
-                changed();
+                tab.updateHeader();
+                edited();
             }
 
             void urlChanged() {
-                if (loading || syncing || req == null) return;
+                if (loading || syncing) return;
                 syncing = true;
                 try {
                     req.setUrl(url.getText());
@@ -2953,11 +3632,11 @@ public class StandaloneRestClient {
                     syncing = false;
                 }
                 updateTabTitles();
-                changed();
+                edited();
             }
 
             void paramsChanged() {
-                if (loading || syncing || req == null) return;
+                if (loading || syncing) return;
                 String text = req.url();
                 if (!text.equals(url.getText())) {
                     // Recorded rather than skipped: later URL edits are position-based and must stay in step.
@@ -2973,30 +3652,30 @@ public class StandaloneRestClient {
                     }
                 }
                 updateTabTitles();
-                changed();
+                edited();
             }
 
             void tableChanged() {
-                if (loading || req == null) return;
+                if (loading) return;
                 updateTabTitles();
-                changed();
+                edited();
             }
 
             void bodyModeChanged() {
-                if (loading || req == null) return;
+                if (loading) return;
                 form.stopEditing();
                 req.bodyMode = bodyJson.isSelected() ? BodyMode.JSON : bodyText.isSelected() ? BodyMode.TEXT
                         : bodyForm.isSelected() ? BodyMode.FORM : BodyMode.NONE;
                 updateBodyControls();
                 updateTabTitles();
-                changed();
+                edited();
             }
 
             void updateBodyControls() {
-                body.setEnabled(req != null && req.bodyMode != BodyMode.NONE);
-                format.setVisible(req == null || req.bodyMode != BodyMode.FORM);
-                format.setEnabled(req != null && req.bodyMode == BodyMode.JSON);
-                ((CardLayout) bodyCards.getLayout()).show(bodyCards, req != null && req.bodyMode == BodyMode.FORM ? "form" : "text");
+                body.setEnabled(req.bodyMode != BodyMode.NONE);
+                format.setVisible(req.bodyMode != BodyMode.FORM);
+                format.setEnabled(req.bodyMode == BodyMode.JSON);
+                ((CardLayout) bodyCards.getLayout()).show(bodyCards, req.bodyMode == BodyMode.FORM ? "form" : "text");
             }
 
             void formatBody() {
@@ -3010,7 +3689,6 @@ public class StandaloneRestClient {
             }
 
             void updateTabTitles() {
-                if (req == null) return;
                 tabs.setTitleAt(0, title("Params", req.params));
                 tabs.setTitleAt(1, title("Headers", req.headers));
                 tabs.setTitleAt(2, switch (req.bodyMode) {
@@ -3028,7 +3706,11 @@ public class StandaloneRestClient {
             }
 
             void updateSendButton() {
-                send.setText(req != null && inFlight.containsKey(req) ? "Cancel" : "Send");
+                send.setText(inFlight.containsKey(tab.saved) ? "Cancel" : "Send");
+            }
+
+            void updateSaveButton() {
+                save.setEnabled(tab.dirty);
             }
         }
 
@@ -3433,6 +4115,45 @@ public class StandaloneRestClient {
             eq("storage active env", "Dev", back.activeEnv().name);
             Request copy = Storage.copy((Request) ((Folder) back.collections.get(0).items.get(0)).items.get(0));
             eq("storage copy", "List users", copy.name);
+            Request original = (Request) ((Folder) w.collections.get(0).items.get(0)).items.get(0);
+            eq("storage keeps request id", original.id, copy.id);
+            check("storage copy has same content", Storage.sameContent(original, copy));
+            copy.headers.add(new KeyValue("X-Draft", "1", true));
+            copy.body = "changed";
+            check("storage edited copy differs", !Storage.sameContent(original, copy));
+            Request target = Storage.copy(original);
+            List<KeyValue> headerList = target.headers;
+            target.copyFrom(copy);
+            check("copyFrom takes the draft", Storage.sameContent(copy, target));
+            check("copyFrom keeps list identity", headerList == target.headers);
+            copy.headers.get(0).value = "mutated";
+            check("copyFrom copies rows", !Storage.sameContent(copy, target));
+            eq("find request by id", original, w.findRequest(original.id));
+            Collection dup = Storage.copy(w.collections.get(0));
+            Storage.freshIds(dup);
+            Request dupFirst = (Request) ((Folder) dup.items.get(0)).items.get(0);
+            check("fresh ids differ", !dupFirst.id.equals(original.id));
+            eq("fresh ids keep content", Json.write(Storage.item(original)).replace(original.id, ""),
+                    Json.write(Storage.item(dupFirst)).replace(dupFirst.id, ""));
+
+            Workspace legacy = Storage.fromJson(Json.obj(Json.parse(
+                    "{\"collections\":[{\"type\":\"collection\",\"name\":\"c\",\"items\":[{\"type\":\"request\",\"name\":\"r\"}]}]}")));
+            check("missing id is generated", !((Request) legacy.collections.get(0).items.get(0)).id.isEmpty());
+            check("no session by default", legacy.openTabs.isEmpty() && !Storage.toJson(legacy).containsKey("session"));
+
+            w.openTabs.add(new OpenTab(original.id, false, copy));
+            w.openTabs.add(new OpenTab("gone", true, null));
+            w.selectedTab = original.id;
+            String withSession = Json.write(Storage.toJson(w));
+            Workspace restored = Storage.fromJson(Json.obj(Json.parse(withSession)));
+            eq("session round trip", withSession, Json.write(Storage.toJson(restored)));
+            eq("session tab count", 2, restored.openTabs.size());
+            eq("session selected", original.id, restored.selectedTab);
+            check("session draft kept", restored.openTabs.get(0).draft() != null
+                    && Storage.sameContent(copy, restored.openTabs.get(0).draft()));
+            check("session preview without draft", restored.openTabs.get(1).preview() && restored.openTabs.get(1).draft() == null);
+            w.openTabs.clear();
+            w.selectedTab = "";
             Files.delete(f);
             Files.delete(f.getParent());
             Files.delete(dir);

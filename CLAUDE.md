@@ -20,7 +20,7 @@ Status: implemented (v1.0). `README.md` has the user-facing feature list.
 ## Layout
 
 ```
-StandaloneRestClient.java   whole application (~2,700 lines)
+StandaloneRestClient.java   whole application (~4,400 lines)
 README.md
 ```
 
@@ -33,6 +33,8 @@ Sections inside `StandaloneRestClient.java`, in this order:
    - Numbers are `Json.Num` (the original text), so values are never rounded.
 3. Model: `KeyValue(key, value, enabled)`, `BodyMode`, `Item` → `Folder` → `Collection`, `Request`, `Environment`, `Settings`, `Workspace`.
    - `Request` stores `baseUrl` (no query) plus a `params` list. `url()` joins them; `setUrl(text)` splits them.
+   - `Request.id` is a UUID, persisted and generated when missing (older files), so session tabs can find their request. `copyFrom` copies every editable field except name and id, mutating the lists in place.
+   - `OpenTab(requestId, preview, draft)` and `Workspace.openTabs` / `selectedTab`: the tab session. `draft` is null when the tab had no unsaved changes.
    - Post-actions are a `List<KeyValue>`: key = variable name, value = JSON path (empty = whole body).
    - `BodyMode.FORM` uses `Request.form` (a `List<KeyValue>`). It's kept separate from `body`, so switching modes loses nothing.
 4. `Urls`: query parse/join and `encode`, which percent-encodes only illegal characters and keeps existing `%XX` escapes.
@@ -45,13 +47,16 @@ Sections inside `StandaloneRestClient.java`, in this order:
      - compiled classes: the classes directory.
    - `data/` is git-ignored.
    - Saves write a temp file and then do an atomic rename.
-   - `Storage.copy` deep-copies an item by serializing it and reading it back.
+   - `Storage.copy` deep-copies an item by serializing it and reading it back. It keeps request ids; `freshIds` gives a duplicate new ones.
+   - `sameContent(a, b)` compares the serialized forms; it is the "unsaved changes" test.
+   - The tab session goes under a `"session"` key (`selected`, `tabs[{id, preview, draft?}]`), written only when tabs are open.
 6. `PostmanImporter`: Postman collection v2.0/v2.1 and environment exports. Returns an `ImportResult` that includes the skipped-features report.
 7. `Response`, `Engine`: variable resolution, `prepare` (builds the URI and headers), async `send` (cancellable), response decoding, `applyPostActions`.
 8. UI:
    - `KvTable`/`KvModel`: reusable key/value table whose last row is a blank row for adding entries.
    - `Ui`: the frame, tree, dialogs, import, and send flow.
-   - `Ui.RequestEditor` and `Ui.ResponseView`.
+   - `Ui.RequestTab`: one open request, with its own `RequestEditor`, plus `Ui.StripMouse` (clicks, drag reorder).
+   - `Ui.RequestEditor` (one per tab) and `Ui.ResponseView` (shared; shows the selected tab's last response).
 9. `SelfTest`: plain assertions, plus an end-to-end HTTP test against a local `HttpServer`.
 
 ## Commands
@@ -92,10 +97,22 @@ $J = "C:\Soft\jdk-25.0.5.0.2+1\bin"
   - `KvModel.setValueAt` (skipping no-op edits) and `KvTable.removeSelected` record the rows as they were before the change.
   - Restoring mutates `rows` in place and calls `onChange`, so undo in Params also rewrites the URL.
   - The keys are bound `WHEN_ANCESTOR_OF_FOCUSED_COMPONENT`. While a cell is being edited, Ctrl+Z cancels the edit instead.
-  - `setRows` (opening a request) and `refresh` (rows changed from outside, e.g. typing in the URL) clear the history, because older snapshots no longer apply.
-- **URL undo:** `RequestEditor.urlUndo`, cleared in `load`.
+  - `setRows` (opening a tab, reverting) and `refresh` (rows changed from outside, e.g. typing in the URL) clear the history, because older snapshots no longer apply.
+- **URL undo:** `RequestEditor.urlUndo`, cleared in `load` (which runs when a tab opens and on Revert, not on save).
   - A URL rewrite from `paramsChanged` is recorded too, wrapped in one `CompoundEdit` (`urlSync`). Document undo edits are position-based, so skipping a programmatic change would break later undos.
   - Undoing in the URL goes through `urlChanged`, which updates the params and so clears the Params table history.
+- **Request tabs:**
+  - `Ui.strip` is a `JTabbedPane` (`SCROLL_TAB_LAYOUT`) holding only empty placeholders, so the ▾ list button can sit beside it. The editors are cards in `Ui.editors`. `openTabs.get(i)` is always tab `i`.
+  - Each `RequestTab` has `saved` (the workspace object, the tree node's user object) and `draft` (`Storage.copy`). The editor only ever edits the draft. `results` and `inFlight` are keyed by `saved`.
+  - Preview: a tree selection or single click calls `openTab(node, true)`, which replaces the existing preview tab when it isn't dirty or sending. Editing (`draftEdited`), sending, double-clicking the request or its tab, Enter in the tree, or "Keep Open" pins it.
+  - The `switching` flag guards programmatic strip changes and tree selections, so tab ↔ tree sync doesn't echo.
+  - Dirty state comes from `Storage.sameContent(draft, saved)`, checked in `refreshCurrent` (`highlightTimer`, 150 ms). It shows as ● on the tab (the close button shows × on hover), in the tree, and as the editor's enabled Save button.
+  - Save (`saveTab`, Ctrl+S; `saveAll`, Ctrl+Shift+S) does `saved.copyFrom(draft)` and then writes the workspace. A workspace save writes only saved requests, plus the session via `syncSession`.
+  - Saved immediately, not buffered: rename (it also renames the draft), move, duplicate (copies the saved version, with `freshIds`), delete (closes affected tabs, warns when they're dirty), environments, variables, settings and post-action results.
+  - Closing a dirty tab asks Save / Don't Save / Cancel. Exit never asks: drafts are persisted in the session and restored by `restoreTabs`. Tabs whose request is gone are dropped.
+  - Closing a tab cancels its send. `finished` ignores a future that is no longer in `inFlight`.
+  - Ctrl+Tab and Ctrl+PgUp/PgDn go through a `KeyEventDispatcher` (`tabSwitchKey`), because Ctrl+Tab is a focus-traversal key and the inner tabbed panes and tables bind Ctrl+PgUp/PgDn. Ctrl+S, Ctrl+Shift+S and Ctrl+W are root-pane bindings.
+  - Drag reorder: `StripMouse` listens on the strip, its internal tab panel and every tab header (a header with a tooltip swallows its clicks). The drop marker is painted in the strip's `paint` override. Auto-scroll at the edges and wheel scrolling move the strip's `JViewport` (`scrollStrip`).
 - **Params ↔ URL sync** works in both directions, with the `syncing` guard flag stopping update loops.
   - Editing the URL replaces the enabled params and keeps the disabled ones.
   - Mutate `params` in place: the table holds a reference to the list.
@@ -115,7 +132,7 @@ $J = "C:\Soft\jdk-25.0.5.0.2+1\bin"
   - Failures (path not found, not JSON) go to the Log tab and never throw.
 - **Networking:**
   - Never call the network on the Swing UI thread; update the UI through `SwingUtilities.invokeLater`.
-  - Model mutations (post-actions) happen on the UI thread.
+  - Model mutations (post-actions) happen on the UI thread. Post-actions use the draft that was sent.
   - Cancelling the future returned by `Engine.send` aborts the HTTP exchange.
   - Defaults to HTTP/1.1; HTTP/2 is a setting.
   - The `HttpClient` is cached and rebuilt only when settings change.
