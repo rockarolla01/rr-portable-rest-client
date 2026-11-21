@@ -1,10 +1,10 @@
 /*
- * StandaloneRestClient - a small standalone REST client (Postman-like) built only on the JDK.
+ * PortableRestClient - a small portable REST client (Postman-like) built only on the JDK.
  *
- *   java StandaloneRestClient.java              start the GUI
- *   java StandaloneRestClient.java --selftest   run the built-in tests
+ *   java PortableRestClient.java              start the GUI
+ *   java PortableRestClient.java --selftest   run the built-in tests
  *
- * Workspace file: data\workspace.json in the app's folder (override with -Drestclient.workspace=<file>).
+ * Workspace file: data\workspace.json in the app's folder (override with -Dportablerestclient.workspace=<file>).
  */
 
 import java.awt.*;
@@ -39,8 +39,8 @@ import javax.swing.tree.*;
 import javax.swing.undo.CompoundEdit;
 import javax.swing.undo.UndoManager;
 
-public class StandaloneRestClient {
-    static final String APP = "StandaloneRestClient";
+public class PortableRestClient {
+    static final String APP = "PortableRestClient";
     static final String VERSION = "1.0";
 
     public static void main(String[] args) throws Exception {
@@ -582,20 +582,20 @@ public class StandaloneRestClient {
 
     static final class Storage {
         static Path defaultFile() {
-            String override = System.getProperty("restclient.workspace");
+            String override = System.getProperty("portablerestclient.workspace");
             if (override != null && !override.isBlank()) return Path.of(override).toAbsolutePath();
             return appDir().resolve("data").resolve("workspace.json");
         }
 
         /**
          * The folder the app runs from: the exe's folder for a jpackage image, the jar's folder,
-         * the source file's folder for "java StandaloneRestClient.java", or the classes directory.
+         * the source file's folder for "java PortableRestClient.java", or the classes directory.
          */
         static Path appDir() {
             String exe = System.getProperty("jpackage.app-path");
             if (exe != null && !exe.isBlank()) return Path.of(exe).toAbsolutePath().getParent();
             try {
-                var source = StandaloneRestClient.class.getProtectionDomain().getCodeSource();
+                var source = PortableRestClient.class.getProtectionDomain().getCodeSource();
                 if (source != null) {
                     Path p = Path.of(source.getLocation().toURI()).toAbsolutePath();
                     return Files.isDirectory(p) ? p : p.getParent();
@@ -624,7 +624,7 @@ public class StandaloneRestClient {
 
         static Map<String, Object> toJson(Workspace w) {
             Map<String, Object> m = new LinkedHashMap<>();
-            m.put("format", "restclient-workspace");
+            m.put("format", "portable-rest-client-workspace");
             m.put("version", 1);
             m.put("activeEnvironment", w.activeEnvironment);
             Map<String, Object> s = new LinkedHashMap<>();
@@ -4105,7 +4105,7 @@ public class StandaloneRestClient {
             w.window = new int[] {1, 2, 800, 600, 0};
             String once = Json.write(Storage.toJson(w));
             eq("storage round trip", once, Json.write(Storage.toJson(Storage.fromJson(Json.obj(Json.parse(once))))));
-            Path dir = Files.createTempDirectory("restclient-test");
+            Path dir = Files.createTempDirectory("portablerestclient-test");
             Path f = dir.resolve("sub").resolve("ws.json");
             Storage.save(w, f);
             Storage.save(w, f); // second save replaces the existing file
@@ -4157,7 +4157,7 @@ public class StandaloneRestClient {
             Files.delete(f);
             Files.delete(f.getParent());
             Files.delete(dir);
-            if (System.getProperty("restclient.workspace") == null)
+            if (System.getProperty("portablerestclient.workspace") == null)
                 eq("storage default location", Storage.appDir().resolve("data").resolve("workspace.json"), Storage.defaultFile());
         }
 
@@ -4169,7 +4169,7 @@ public class StandaloneRestClient {
             Path keytool = Path.of(System.getProperty("java.home"), "bin",
                     System.getProperty("os.name").startsWith("Windows") ? "keytool.exe" : "keytool");
             if (!Files.exists(keytool)) { System.out.println("SKIP https: no keytool in " + keytool.getParent()); return; }
-            Path dir = Files.createTempDirectory("restclient-tls");
+            Path dir = Files.createTempDirectory("portablerestclient-tls");
             Path store = dir.resolve("server.p12");
             char[] pass = "changeit".toCharArray();
             try {

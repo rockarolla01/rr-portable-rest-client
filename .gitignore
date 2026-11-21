@@ -1,6 +1,6 @@
 build/
 dist/
-# collections, environments and settings (RestClient workspace)
+# collections, environments and settings (PortableRestClient workspace)
 data/
 # Claude Code worktrees (full checkouts of this repo)
 .claude/worktrees/
