@@ -2,7 +2,7 @@
 
 ## Project
 
-A standalone, simplified Postman-like REST client with a desktop GUI. It's written in Java and has **no third-party dependencies**.
+A portable, simplified Postman-like REST client with a desktop GUI. It's written in Java and has **no third-party dependencies**.
 
 Status: implemented (v1.0). `README.md` has the user-facing feature list.
 
@@ -13,18 +13,18 @@ Status: implemented (v1.0). `README.md` has the user-facing feature list.
   - The packaged runtime also includes `jdk.charsets`, so responses in non-UTF charsets decode.
   - Self-tests use `jdk.httpserver`. That's fine because they run on the full JDK, but never use it in app code.
   - No Maven/Gradle, no libraries, no JUnit.
-- **As few source files as possible.** Everything goes in `StandaloneRestClient.java` as nested classes. Don't create new source files unless asked.
+- **As few source files as possible.** Everything goes in `PortableRestClient.java` as nested classes. Don't create new source files unless asked.
 - **JDK:** `C:\Soft\jdk-25.0.5.0.2+1` (Java 25 LTS). It may not be on `PATH`, so call its `bin\java.exe` / `javac.exe` directly. Java 25 language features are allowed.
 - **No JavaScript.** The JDK has no JS engine, so Postman `pm.*` scripts can't run. Post-request processing is a simple rule instead (see below).
 
 ## Layout
 
 ```
-StandaloneRestClient.java   whole application (~4,400 lines)
+PortableRestClient.java   whole application (~4,400 lines)
 README.md
 ```
 
-Sections inside `StandaloneRestClient.java`, in this order:
+Sections inside `PortableRestClient.java`, in this order:
 1. `main`:
    - Sets `jdk.httpclient.allowRestrictedHeaders=host`. It must happen before any `java.net.http` class loads.
    - Then launches the GUI, or runs `--selftest`.
@@ -39,11 +39,11 @@ Sections inside `StandaloneRestClient.java`, in this order:
    - `BodyMode.FORM` uses `Request.form` (a `List<KeyValue>`). It's kept separate from `body`, so switching modes loses nothing.
 4. `Urls`: query parse/join and `encode`, which percent-encodes only illegal characters and keeps existing `%XX` escapes.
 5. `Storage`: the workspace JSON format.
-   - The default file is `<appDir>\data\workspace.json`; override it with `-Drestclient.workspace=…`.
+   - The default file is `<appDir>\data\workspace.json`; override it with `-Dportablerestclient.workspace=…`.
    - `appDir()` is the folder the app runs from:
      - jpackage exe: the folder of `jpackage.app-path`.
      - jar: the jar's folder.
-     - `java StandaloneRestClient.java`: the source file's folder.
+     - `java PortableRestClient.java`: the source file's folder.
      - compiled classes: the classes directory.
    - `data/` is git-ignored.
    - Saves write a temp file and then do an atomic rename.
@@ -63,14 +63,14 @@ Sections inside `StandaloneRestClient.java`, in this order:
 
 ```powershell
 $J = "C:\Soft\jdk-25.0.5.0.2+1\bin"
-& "$J\java.exe" StandaloneRestClient.java              # run from source, no build step
-& "$J\java.exe" StandaloneRestClient.java --selftest   # run self-tests (exit code != 0 on failure)```
+& "$J\java.exe" PortableRestClient.java              # run from source, no build step
+& "$J\java.exe" PortableRestClient.java --selftest   # run self-tests (exit code != 0 on failure)```
 
 - After any change to `Json`, `Urls`, `Storage`, `PostmanImporter` or `Engine`, run `--selftest`.
 - Add a self-test case when you fix a bug in those sections.
 - Compile with `-Xlint:all,-serial`; it should produce no warnings.
 - **GUI testing:** don't drive the user's real desktop (focus stealing, screen capture). Use a harness instead:
-  - Construct `StandaloneRestClient.Ui` with a scratch workspace.
+  - Construct `PortableRestClient.Ui` with a scratch workspace.
   - Call `frame.setFocusableWindowState(false)`.
   - Paint the root pane into a `BufferedImage`.
 
@@ -121,7 +121,7 @@ $J = "C:\Soft\jdk-25.0.5.0.2+1\bin"
   - JSON body → `Content-Type: application/json`.
   - Text body → `text/plain; charset=UTF-8`.
   - Form body → `application/x-www-form-urlencoded`.
-  - `User-Agent: RestClient/1.0` and `Accept: */*`.
+  - `User-Agent: PortableRestClient/1.0` and `Accept: */*`.
 - **Form body (`x-www-form-urlencoded`):** `Engine.formBody` substitutes variables in each enabled field first, then encodes the key and value with `URLEncoder` (UTF-8, space → `+`). That way a resolved `&` or `=` can't split a field.
 - **Response display:**
   - Pretty-print when the content type is JSON or the body starts with `{`/`[` and parses. This is computed off the UI thread in `Response.analyze()`.

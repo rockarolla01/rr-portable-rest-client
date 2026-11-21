@@ -1,6 +1,6 @@
-# Standalone REST Client
+# Portable REST Client
 
-A small, standalone REST client in the spirit of Postman. It's a single Java source file with no third-party libraries; it needs only JDK 25.
+A small, portable REST client in the spirit of Postman. It's a single Java source file with no third-party libraries; it needs only JDK 25.
 
 ## Features
 
@@ -50,15 +50,15 @@ A small, standalone REST client in the spirit of Postman. It's a single Java sou
 
 ```powershell
 $J = "C:\Soft\jdk-25.0.5.0.2+1\bin"
-& "$J\java.exe" StandaloneRestClient.java              # run from source, no build step
-& "$J\java.exe" StandaloneRestClient.java --selftest   # built-in tests
+& "$J\java.exe" PortableRestClient.java              # run from source, no build step
+& "$J\java.exe" PortableRestClient.java --selftest   # built-in tests
 ```
 
 ## Data location
 
 Collections, environments, settings and the open tabs (with their unsaved drafts) are saved in one file, `data\workspace.json` (git-ignored), next to the source file.
 
-To use a different file, add `-Drestclient.workspace=C:\path\to\workspace.json` to the `java` command.
+To use a different file, add `-Dportablerestclient.workspace=C:\path\to\workspace.json` to the `java` command.
 
 ## Shortcuts
 
