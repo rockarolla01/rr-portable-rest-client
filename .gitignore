@@ -1,0 +1,6 @@
+build/
+dist/
+# collections, environments and settings (RestClient workspace)
+data/
+# Claude Code worktrees (full checkouts of this repo)
+.claude/worktrees/
