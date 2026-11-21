@@ -1,6 +1,29 @@
 # Portable REST Client
 
-A small, portable REST client in the spirit of Postman. It's a single Java source file with no third-party libraries; it needs only JDK 25.
+**#vibeCoded**
+
+A small, portable REST client in the spirit of Postman. Key features:
+- All the source code is located in a single file, `PortableRestClient.java`, with no third-party dependencies.
+- Fully portable: all user data (collections and environments) is stored in a local folder next to the source file.
+- Supports basic REST client features:
+  - HTTP requests.
+  - Collections of requests and environments.
+  - Minimalistic request post-processing (namely, "get a JSON response field and store it in an environment variable"). No scripting is supported.
+  - curl command generation.
+  - Import of Postman collections and environments.
+
+It requires only a JDK to run (which can be portable too, e.g. OpenJDK; tested with JDK 21 and 25). You don't need to compile `PortableRestClient.java`; you can run the source file directly.
+
+For example:
+```
+cd C:\portable-rest-client-location
+
+C:\my-openjdk-location\bin\java.exe PortableRestClient.java
+```
+
+Below is a detailed, AI-generated overview.
+
+---
 
 ## Features
 
@@ -14,8 +37,8 @@ A small, portable REST client in the spirit of Postman. It's a single Java sourc
   - A ● on the tab and in the tree marks unsaved changes. Undoing back to the saved state clears it.
   - **Send** and the curl tab use what you see, saved or not.
   - Closing a tab with unsaved changes asks whether to save them. Exiting doesn't ask: open tabs and their unsaved drafts are restored the next time you start the app.
-  - Rename, move, duplicate (which copies the saved version) and delete in the tree, environments, variables and settings still save at once.
-- Environments, and collection variables. `{{var}}` placeholders work in the URL, params, headers and body.
+  - Renaming, moving, duplicating (which copies the saved version) and deleting in the tree are saved immediately, as are changes to environments, variables and settings.
+- Environments and collection variables. `{{var}}` placeholders work in the URL, params, headers and body.
   - The active environment wins over collection variables.
   - In the URL, body, params, headers and form fields, `{{var}}` references are highlighted: orange if the variable is defined, red if not. Hover one to see its value and where it comes from.
   - A few dynamic variables are built in: `{{$guid}}`, `{{$timestamp}}`, `{{$isoTimestamp}}`, `{{$randomInt}}`.
@@ -71,8 +94,8 @@ To use a different file, add `-Dportablerestclient.workspace=C:\path\to\workspac
 - **Delete** in a table: remove the selected rows.
 - **Ctrl+Z** / **Ctrl+Y** in the body editor or the URL field: undo / redo, separately in each tab. A URL change made from the Params table undoes as one step.
 - **Ctrl+Z** / **Ctrl+Y** in a table (Params, Headers, Form, Post-processing, variables): undo / redo cell edits, added rows and removed rows. While a cell is being edited, Ctrl+Z first discards the typed text. Saving keeps the history; closing the tab discards it.
-- **Ctrl+F** in the request or response body: find. **Enter** / **Shift+Enter** or **F3** / **Shift+F3** for the next / previous match; **Esc** closes it.
+- **Ctrl+F** in the request or response body: find. **Enter** / **Shift+Enter** or **F3** / **Shift+F3** for the next / previous match; **Esc** closes the find bar.
 
 ## Not supported
 
-Postman scripts (other than the simple variable-setting pattern), multipart form-data and file bodies, other auth types (OAuth, digest, …), cookies management, WebSocket/GraphQL, and export back to Postman.
+Postman scripts (other than the simple variable-setting pattern), multipart form-data and file bodies, other auth types (OAuth, digest, …), cookie management, WebSocket/GraphQL, and export back to Postman.
