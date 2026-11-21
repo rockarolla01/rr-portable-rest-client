@@ -56,7 +56,7 @@ $J = "C:\Soft\jdk-25.0.5.0.2+1\bin"
 
 ## Data location
 
-Collections, environments, settings and the open tabs (with their unsaved drafts) are saved in one file, `standalone-rest-client\data\workspace.json` (git-ignored), next to the source file.
+Collections, environments, settings and the open tabs (with their unsaved drafts) are saved in one file, `data\workspace.json` (git-ignored), next to the source file.
 
 To use a different file, add `-Drestclient.workspace=C:\path\to\workspace.json` to the `java` command.
 
