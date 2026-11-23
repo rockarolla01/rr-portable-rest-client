@@ -13,21 +13,22 @@ Status: implemented (v1.0). `README.md` has the user-facing feature list.
   - The packaged runtime also includes `jdk.charsets`, so responses in non-UTF charsets decode.
   - Self-tests use `jdk.httpserver`. That's fine because they run on the full JDK, but never use it in app code.
   - No Maven/Gradle, no libraries, no JUnit.
-- **As few source files as possible.** Everything goes in `PortableRestClient.java` as nested classes. Don't create new source files unless asked.
+- **As few source files as possible.** All app code goes in `PortableRestClient.java` as nested classes; all tests go in `test/SelfTest.java`. Don't create new source files unless asked.
 - **JDK:** `C:\Soft\jdk-25.0.5.0.2+1` (Java 25 LTS). It may not be on `PATH`, so call its `bin\java.exe` / `javac.exe` directly. Java 25 language features are allowed.
 - **No JavaScript.** The JDK has no JS engine, so Postman `pm.*` scripts can't run. Post-request processing is a simple rule instead (see below).
 
 ## Layout
 
 ```
-PortableRestClient.java   whole application (~4,400 lines)
+PortableRestClient.java   whole application (~4,050 lines)
+test/SelfTest.java        self-tests (~630 lines)
 README.md
 ```
 
 Sections inside `PortableRestClient.java`, in this order:
 1. `main`:
    - Sets `jdk.httpclient.allowRestrictedHeaders=host`. It must happen before any `java.net.http` class loads.
-   - Then launches the GUI, or runs `--selftest`.
+   - Then launches the GUI.
 2. `Json`: recursive-descent parser, compact writer, pretty-printer, `at(root, path)` lookup, and loose accessors (`obj`/`arr`/`str`/`bool`/`integer`).
    - Objects are `LinkedHashMap`, so key order is kept.
    - Numbers are `Json.Num` (the original text), so values are never rounded.
@@ -58,16 +59,24 @@ Sections inside `PortableRestClient.java`, in this order:
    - `Ui`: the frame, tree, dialogs, import, and send flow.
    - `Ui.RequestTab`: one open request, with its own `RequestEditor`, plus `Ui.StripMouse` (clicks, drag reorder).
    - `Ui.RequestEditor` (one per tab) and `Ui.ResponseView` (shared; shows the selected tab's last response).
-9. `SelfTest`: plain assertions, plus an end-to-end HTTP test against a local `HttpServer`.
+
+Tests are in `test/SelfTest.java`: plain assertions, plus end-to-end HTTP/HTTPS tests against a local `HttpServer`.
+- It's a top-level class that `extends PortableRestClient`. Default-package classes can't be imported, so extending puts the nested types (`Json`, `Request`, `Engine`, …) in scope by their simple names.
+- Its own `main` sets the same `allowRestrictedHeaders` property as the app's (the http tests override `Host`), then exits with `run()`'s result.
+- It reaches package-private members, so it must be compiled together with the app and run from class files. Launching it as a source file with the app on the class path fails, because the two end up in different class loaders.
 
 ## Commands
 
 ```powershell
 $J = "C:\Soft\jdk-25.0.5.0.2+1\bin"
 & "$J\java.exe" PortableRestClient.java              # run from source, no build step
-& "$J\java.exe" PortableRestClient.java --selftest   # run self-tests (exit code != 0 on failure)```
 
-- After any change to `Json`, `Urls`, `Storage`, `PostmanImporter` or `Engine`, run `--selftest`.
+# self-tests (exit code != 0 on failure); build/ is git-ignored
+& "$J\javac.exe" -Xlint:all,-serial -d build\test PortableRestClient.java test\SelfTest.java
+& "$J\java.exe" -cp build\test SelfTest
+```
+
+- After any change to `Json`, `Urls`, `Storage`, `PostmanImporter` or `Engine`, run the self-tests.
 - Add a self-test case when you fix a bug in those sections.
 - Compile with `-Xlint:all,-serial`; it should produce no warnings.
 - **GUI testing:** don't drive the user's real desktop (focus stealing, screen capture). Use a harness instead:
