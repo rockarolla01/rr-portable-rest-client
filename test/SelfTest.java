@@ -13,6 +13,7 @@ import java.net.*;
 import java.net.http.*;
 import java.nio.charset.*;
 import java.nio.file.*;
+import java.nio.file.attribute.FileTime;
 import java.time.*;
 import java.util.*;
 import java.util.List;
@@ -45,6 +46,7 @@ final class SelfTest extends PortableRestClient {
         t.section("download", t::download);
         t.section("postman", t::postman);
         t.section("storage", t::storage);
+        t.section("split storage", t::splitStorage);
         t.section("multipart", t::multipart);
         t.section("http", t::http);
         t.section("https", t::https);
@@ -416,8 +418,20 @@ final class SelfTest extends PortableRestClient {
         Files.delete(f);
         Files.delete(f.getParent());
         Files.delete(dir);
-        if (System.getProperty("portablerestclient.workspace") == null)
-            eq("storage default location", Storage.appDir().resolve("data").resolve("workspace.json"), Storage.defaultFile());
+        String folder = System.getProperty("workspace.folder");
+        try {
+            System.clearProperty("workspace.folder");
+            eq("storage default location", Storage.appDir().resolve("data"), Storage.workspaceFolder());
+            System.setProperty("workspace.folder", "C:\\elsewhere\\ws");
+            eq("workspace folder property", Path.of("C:\\elsewhere\\ws"), Storage.workspaceFolder());
+            System.setProperty("workspace.folder", "..\\shared");
+            eq("relative workspace folder", Storage.appDir().resolve("..\\shared").normalize(), Storage.workspaceFolder());
+            eq("single file in the folder", Path.of("C:\\elsewhere\\ws\\workspace.json"),
+                    new WorkspaceStore(Path.of("C:\\elsewhere\\ws")).single);
+        } finally {
+            if (folder == null) System.clearProperty("workspace.folder");
+            else System.setProperty("workspace.folder", folder);
+        }
     }
 
     /**
@@ -491,6 +505,176 @@ final class SelfTest extends PortableRestClient {
     static String prepared(List<String[]> headers, String name) {
         for (String[] h : headers) if (h[0].equalsIgnoreCase(name)) return h[1];
         return null;
+    }
+
+    /** Same content as Storage.toJson, ignoring the storage setting (it says which layout the data came from). */
+    static String content(Workspace w) {
+        Map<String, Object> m = Storage.toJson(w);
+        Json.obj(m.get("settings")).remove("storage");
+        return Json.write(m);
+    }
+
+    static Workspace sample() {
+        Workspace w = new Workspace();
+        w.collections.add(PostmanImporter.importText(SAMPLE).collection);
+        Collection second = new Collection("Admin/Tools: \"v2\"");
+        second.items.add(new Request("ping"));
+        w.collections.add(second);
+        w.collections.add(new Collection("admin/tools: \"V2\"")); // same file name ignoring case
+        Environment dev = new Environment("Dev");
+        dev.vars.add(new KeyValue("host", "localhost", true));
+        w.environments.add(dev);
+        w.environments.add(new Environment("CON"));
+        w.activeEnvironment = "Dev";
+        w.settings.timeoutSeconds = 9;
+        return w;
+    }
+
+    void splitStorage() throws IOException {
+        Path dir = Files.createTempDirectory("portablerestclient-split");
+        try {
+            WorkspaceStore store = new WorkspaceStore(dir);
+            Workspace first = store.load();
+            check("first run is split", first.settings.splitStorage);
+            check("first run is empty", first.collections.isEmpty() && first.environments.isEmpty());
+
+            eq("file names", List.of("Admin_Tools_ _v2_.json", "admin_tools_ _V2_ (2).json", "unnamed.json", "_CON.json"),
+                    WorkspaceStore.fileNames(List.of("Admin/Tools: \"v2\"", "admin\\tools: \"V2\"", " ..", "CON")));
+
+            Workspace w = sample();
+            store.save(w, true);
+            Path coll = dir.resolve("collections");
+            Path envs = dir.resolve("environments");
+            check("settings file", Files.exists(dir.resolve("settings.json")));
+            check("no single file in split mode", !Files.exists(dir.resolve("workspace.json")));
+            eq("one file per collection", 3L, countJson(coll));
+            eq("one file per environment", 2L, countJson(envs));
+            check("environment files", Files.exists(envs.resolve("Dev.json")) && Files.exists(envs.resolve("_CON.json")));
+            check("settings.json has no collections inline",
+                    !Files.readString(dir.resolve("settings.json")).contains("\"items\""));
+
+            Workspace back = new WorkspaceStore(dir).load();
+            check("split reload is split", back.settings.splitStorage);
+            eq("split round trip", content(w), content(back));
+
+            // Unchanged files are not rewritten; a changed environment is.
+            FileTime old = FileTime.fromMillis(0);
+            Path users = coll.resolve(WorkspaceStore.fileNames(List.of(w.collections.get(0).name)).get(0));
+            Files.setLastModifiedTime(users, old);
+            Files.setLastModifiedTime(envs.resolve("Dev.json"), old);
+            w.environments.get(0).vars.add(new KeyValue("token", "t", true));
+            store.save(w, true);
+            eq("unchanged collection not rewritten", old, Files.getLastModifiedTime(users));
+            check("changed environment rewritten", !old.equals(Files.getLastModifiedTime(envs.resolve("Dev.json"))));
+
+            // A session-only save leaves the collection files alone.
+            w.collections.get(1).items.add(new Request("unsaved"));
+            Path admin = coll.resolve("Admin_Tools_ _v2_.json");
+            Files.setLastModifiedTime(admin, old);
+            store.save(w, false);
+            eq("session save skips collections", old, Files.getLastModifiedTime(admin));
+            store.save(w, true);
+            check("data save writes the collection", Files.readString(admin).contains("unsaved"));
+
+            // Renaming and deleting remove the old files.
+            w.collections.get(1).name = "Renamed";
+            w.collections.remove(2);
+            store.save(w, true);
+            check("renamed collection file", Files.exists(coll.resolve("Renamed.json")) && !Files.exists(admin));
+            eq("deleted collection file removed", 2L, countJson(coll));
+            eq("order kept from settings.json", List.of(w.collections.get(0).name, "Renamed"),
+                    new WorkspaceStore(dir).load().collections.stream().map(c -> c.name).toList());
+
+            // A broken collection file is set aside; the rest still loads.
+            Files.writeString(coll.resolve("Renamed.json"), "{ broken");
+            WorkspaceStore again = new WorkspaceStore(dir);
+            Workspace partial = again.load();
+            eq("broken collection skipped", 1, partial.collections.size());
+            eq("broken collection reported", 1, again.problems.size());
+            check("broken collection renamed aside", !Files.exists(coll.resolve("Renamed.json")));
+            try (var s = Files.list(coll)) {
+                check("aside file kept", s.anyMatch(f -> f.getFileName().toString().startsWith("Renamed.json.broken-")));
+            }
+
+            // A broken settings.json is reported with its path.
+            String settingsText = Files.readString(dir.resolve("settings.json"));
+            Files.writeString(dir.resolve("settings.json"), "[");
+            try {
+                new WorkspaceStore(dir).load();
+                check("broken settings.json throws", false);
+            } catch (WorkspaceStore.UnreadableFile e) {
+                eq("broken settings.json named", dir.resolve("settings.json"), e.file);
+            }
+            Files.writeString(dir.resolve("settings.json"), settingsText);
+        } finally {
+            deleteTree(dir);
+        }
+
+        Path legacyDir = Files.createTempDirectory("portablerestclient-legacy");
+        try {
+            Path single = legacyDir.resolve("workspace.json");
+            Workspace old = sample();
+            old.settings.splitStorage = false;
+            Storage.save(old, single);
+            // Older versions wrote no storage setting.
+            Files.writeString(single, Files.readString(single).replace(",\n    \"storage\": \"single\"", ""));
+            check("legacy file has no storage setting", !Files.readString(single).contains("\"storage\""));
+            WorkspaceStore store = new WorkspaceStore(legacyDir);
+            Workspace w = store.load();
+            check("existing workspace.json stays single", !w.settings.splitStorage);
+            store.save(w, true);
+            check("single save writes no split files",
+                    !Files.exists(legacyDir.resolve("settings.json")) && !Files.exists(legacyDir.resolve("collections")));
+
+            // Migrate single -> split: stale split files are overwritten or removed.
+            Files.createDirectories(legacyDir.resolve("collections"));
+            Files.writeString(legacyDir.resolve("collections").resolve("Stale.json"), "{\"type\":\"collection\",\"name\":\"Stale\"}");
+            eq("existing split files listed", List.of(legacyDir.resolve("collections").resolve("Stale.json")), store.existingFiles(true));
+            store.switchTo(w, true, true);
+            check("migrated to split", w.settings.splitStorage);
+            check("stale split file removed", !Files.exists(legacyDir.resolve("collections").resolve("Stale.json")));
+            Workspace reloaded = new WorkspaceStore(legacyDir).load();
+            check("split is active after migration", reloaded.settings.splitStorage);
+            eq("migration keeps content", content(w), content(reloaded));
+
+            // Split -> single without migration opens workspace.json as it was, and settings.json now points there.
+            w.collections.get(0).name = "Only in split";
+            w.settings.timeoutSeconds = 11;
+            store.save(w, true);
+            store.switchTo(w, false, false);
+            check("switched to single", !w.settings.splitStorage);
+            eq("single data opened", old.collections.get(0).name, w.collections.get(0).name);
+            eq("settings kept across the switch", 11, w.settings.timeoutSeconds);
+            check("settings.json marks single", Files.readString(legacyDir.resolve("settings.json")).contains("\"storage\": \"single\""));
+            Workspace afterRestart = new WorkspaceStore(legacyDir).load();
+            check("single is active after restart", !afterRestart.settings.splitStorage);
+            eq("single content after restart", old.collections.get(0).name, afterRestart.collections.get(0).name);
+
+            // ...and back to split without migration finds the split data again.
+            store.switchTo(w, true, false);
+            check("back to split", w.settings.splitStorage);
+            eq("split data opened", "Only in split", w.collections.get(0).name);
+            check("split is active again", new WorkspaceStore(legacyDir).load().settings.splitStorage);
+
+            // Split -> single with migration overwrites workspace.json.
+            store.switchTo(w, false, true);
+            Workspace migrated = new WorkspaceStore(legacyDir).load();
+            check("single is active after migration", !migrated.settings.splitStorage);
+            eq("migrated to single", "Only in split", migrated.collections.get(0).name);
+            eq("existing single file listed", List.of(single), store.existingFiles(false));
+        } finally {
+            deleteTree(legacyDir);
+        }
+    }
+
+    static long countJson(Path folder) throws IOException {
+        try (var s = Files.list(folder)) { return s.filter(p -> p.toString().endsWith(".json")).count(); }
+    }
+
+    static void deleteTree(Path dir) throws IOException {
+        try (var s = Files.walk(dir)) {
+            for (Path p : s.sorted(Comparator.reverseOrder()).toList()) Files.deleteIfExists(p);
+        }
     }
 
     void multipart() throws Exception {

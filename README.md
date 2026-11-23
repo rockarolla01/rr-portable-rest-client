@@ -76,8 +76,8 @@ Below is a detailed, AI-generated overview.
   - When it's off and a request fails with an SSL error, the error message suggests turning it on.
 - A **curl** tab on each request shows the equivalent `curl` command (POSIX shell quoting), with variables resolved and a Copy button.
   - The **Verbose (-v)** and **Multi-line** checkboxes apply to all requests and are saved with the workspace.
-- Settings: timeout, redirects, HTTP/2.
-- Everything else auto-saves to `data\workspace.json` next to the source file (see [Data location](#data-location)).
+- Settings: timeout, redirects, HTTP/2, and workspace storage (one file or multiple files).
+- Everything else auto-saves to the `data` folder next to the source file (see [Data location](#data-location)).
 
 ## Run
 
@@ -101,9 +101,24 @@ or by hand:
 
 ## Data location
 
-Collections, environments, settings and the open tabs (with their unsaved drafts) are saved in one file, `data\workspace.json` (git-ignored), next to the source file.
+Collections, environments, settings and the open tabs (with their unsaved drafts) are saved in the `data` folder (git-ignored) next to the source file. **Settings → Workspace storage** picks the layout:
 
-To use a different file, add `-Dportablerestclient.workspace=C:\path\to\workspace.json` to the `java` command.
+- **Multiple files** (the default for a new workspace):
+  - `data\settings.json`: settings, window and tree state, the open tabs, and the order of the other files.
+  - `data\collections\<name>.json`: one file per collection.
+  - `data\environments\<name>.json`: one file per environment.
+
+  Only files whose content changed are rewritten. Switching tabs or typing in an unsaved draft writes `settings.json` alone.
+- **One file**: everything in `data\workspace.json`. A workspace from an older version keeps using it until you switch.
+
+When you switch layouts, the **Migrate workspace** checkbox becomes available:
+
+- Checked: the current workspace is written in the new layout. You're warned first, because existing files in that layout are overwritten. In the multiple-files layout, collection and environment files that aren't part of the workspace are deleted.
+- Unchecked: the app opens whatever is already stored in the new layout, or an empty workspace. Settings stay as they are. The old layout's files are kept, so switching back brings them back.
+
+A file that can't be read is renamed to `<name>.broken-<time>`, and you're told about it.
+
+To use a different folder, add `-Dworkspace.folder=C:\path\to\folder` to the `java` command, before the source file or class name. A relative path is resolved against the app's folder. Both layouts live in that folder: the one-file layout reads and writes `workspace.json` there.
 
 ## Shortcuts
 
