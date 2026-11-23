@@ -128,6 +128,18 @@ $J = "C:\Soft\jdk-25.0.5.0.2+1\bin"
   - Pretty-print when the content type is JSON or the body starts with `{`/`[` and parses. This is computed off the UI thread in `Response.analyze()`.
   - The charset comes from `Content-Type`; gzip/deflate bodies are decoded.
   - Binary bodies show their size only; display is capped at 10 MB.
+- **Downloads:**
+  - The editor's **▾** button (`sendMenu`, beside Send) offers Send / "Send and Download…", which call `sendOrCancel(download)`. Ctrl+Enter is always a plain Send. The ▾ is disabled while a send is running.
+  - In download mode, `finished` sets `Response.awaitingSave`, so the body isn't rendered behind the dialog. It then calls `saveResponse`, which opens a `JFileChooser` and confirms before overwriting.
+    - The chooser opens in `Workspace.downloadDir`: the saved file's parent folder, persisted as `"downloadDir"` and written only when set. A folder that no longer exists falls back to the system default. On success, `Response.savedTo` makes the body view show the path instead of the content; a cancel renders the body as usual and notes it in the Log.
+  - The response view's **Save to File…** saves the current response (`saveResponse`) without changing what's shown.
+  - The bytes written are `Response.bytes`, after gzip/deflate decoding.
+  - `Engine.downloadName` (non-UI, self-tested) picks the name from `Content-Disposition`: RFC 8187 `filename*` first, then `filename` (quoted or token). `safeFileName` drops any directory part and characters Windows rejects, strips trailing dots and spaces, and prefixes reserved device names with `_`. The default name is `response`.
+  - A name without an extension gets one from `extensionFor(contentType, url)`:
+    - First the `TYPE_EXTENSIONS` map (parameters stripped), then `+json`/`+xml` suffixes.
+    - Then the extension of the final URL's last path segment (`urlExtension`). Server-script extensions such as `.php` are ignored.
+    - Otherwise `txt`.
+    - Generic types (`octet-stream`, `text/plain`) aren't in the map on purpose, so the URL can say more.
 - **Post-processing:** only on a 2xx status. Values go to the active environment, or to the collection variables when there is none.
   - Strings are stored raw; other JSON values are stored as compact JSON.
   - Failures (path not found, not JSON) go to the Log tab and never throw.
