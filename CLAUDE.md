@@ -20,8 +20,8 @@ Status: implemented (v1.0). `README.md` has the user-facing feature list.
 ## Layout
 
 ```
-PortableRestClient.java   whole application (~4,450 lines)
-test/SelfTest.java        self-tests (~790 lines)
+PortableRestClient.java   whole application (~4,870 lines)
+test/SelfTest.java        self-tests (~960 lines)
 test/run.ps1              compiles app + tests into build\test and runs them
 README.md
 ```
@@ -44,7 +44,7 @@ Sections inside `PortableRestClient.java`, in this order:
      - Storage writes `type` (`text`/`file`) and `headers` on each part.
 4. `Urls`: query parse/join and `encode`, which percent-encodes only illegal characters and keeps existing `%XX` escapes.
 5. `Storage`: the workspace JSON format.
-   - The default file is `<appDir>\data\workspace.json`; override it with `-Dportablerestclient.workspace=…`.
+   - `workspaceFolder()` is `<appDir>\data` by default; override it with `-Dworkspace.folder=…` (a relative path resolves against `appDir()`). Both layouts live in it; the single file is `workspace.json` there (see `WorkspaceStore`).
    - `appDir()` is the folder the app runs from:
      - jpackage exe: the folder of `jpackage.app-path`.
      - jar: the jar's folder.
@@ -56,6 +56,15 @@ Sections inside `PortableRestClient.java`, in this order:
    - `sameContent(a, b)` compares the serialized forms; it is the "unsaved changes" test.
    - `treeScrollX` (the collections tree's horizontal scroll position) is saved on exit and restored after the first layout. `Ui.select` scrolls the tree only vertically, so selecting a deep node never moves it sideways.
    - The tab session goes under a `"session"` key (`selected`, `tabs[{id, preview, draft?}]`), written only when tabs are open.
+   - `toJson(w, format, collections, environments)` / `stateFromJson` are shared by both layouts: the single file puts the objects inline, settings.json puts file names there.
+5b. `WorkspaceStore(folder)`: the two layouts in the workspace folder, chosen by `Settings.splitStorage` (persisted as `settings.storage` = `split`/`single`).
+   - Single: `workspace.json`. Split: `settings.json` (state, session, file order) + `collections\*.json` + `environments\*.json`.
+   - `load()` detection: settings.json present → its `storage` decides (a split workspace switched to single keeps its settings.json, marked `single`). Else workspace.json → single (older versions). Else split (first run, or a lost settings.json: every file in the folders is loaded).
+   - File names come from `fileNames`: Windows-safe, `/` and `\` replaced, unique ignoring case (`name (2).json`). Listed files load in settings.json's order, then unlisted ones by name.
+   - `known` caches each file's pretty JSON: unchanged files aren't rewritten. `save(w, data)` with `data` false writes settings.json only. `Ui.dataChanged` (set by `changed()`, `saveTab`/`saveAll` and `exit`) supplies `data`; tab switches and draft edits only restart `saveTimer`, so they stay session-only.
+   - A split save writes collections and environments first, then settings.json, then deletes `.json` files in the folders that no longer map to anything.
+   - An unreadable collection or environment file is renamed to `.broken-<time>` and reported in `problems`. An unreadable settings.json or workspace.json throws `UnreadableFile`. `Ui` then renames it aside: for settings.json it reloads, for workspace.json it starts empty.
+   - `switchTo(w, split, migrate)` reads the target first, then saves the layout being left. Migrate clears `known` and writes everything (the overwrite warning is `Ui.confirmMigration`). Without migrate, it replaces collections, environments, active environment and tabs with the target's; settings and window state stay. `Ui.reloadWorkspace` then rebuilds the tree and tabs.
 6. `PostmanImporter`: Postman collection v2.0/v2.1 and environment exports. Returns an `ImportResult` that includes the skipped-features report.
 7. `Response`, `Engine`: variable resolution, `prepare` (builds the URI and headers), async `send` (cancellable), response decoding, `applyPostActions`.
 8. UI:

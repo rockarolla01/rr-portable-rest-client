@@ -5,7 +5,8 @@
  *
  * Tests live in test/SelfTest.java (see that file for how to run them).
  *
- * Workspace file: data\workspace.json in the app's folder (override with -Dportablerestclient.workspace=<file>).
+ * Workspace: the data folder in the app's folder, as settings.json + collections\ + environments\, or one workspace.json
+ * (Settings → Workspace storage). Use another folder with -Dworkspace.folder=<folder>.
  */
 
 import java.awt.*;
@@ -49,10 +50,10 @@ public class PortableRestClient {
         // Read once when java.net.http initialises, so it must be set before any HTTP class loads.
         if (System.getProperty("jdk.httpclient.allowRestrictedHeaders") == null)
             System.setProperty("jdk.httpclient.allowRestrictedHeaders", "host");
-        Path file = Storage.defaultFile();
+        Path folder = Storage.workspaceFolder();
         SwingUtilities.invokeLater(() -> {
             try { UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName()); } catch (Exception ignored) { }
-            new Ui(file).start();
+            new Ui(folder).start();
         });
     }
 
@@ -490,6 +491,11 @@ public class PortableRestClient {
         boolean curlVerbose;
         /** Splits the curl command over lines with " \" continuations; off gives one line. */
         boolean curlMultiline = true;
+        /**
+         * Workspace layout in the data folder: settings.json plus a file per collection and environment (true),
+         * or a single workspace.json. A first run starts split; a workspace.json from older versions stays single.
+         */
+        boolean splitStorage = true;
     }
 
     static final class Workspace {
@@ -610,10 +616,14 @@ public class PortableRestClient {
     // =====================================================================================
 
     static final class Storage {
-        static Path defaultFile() {
-            String override = System.getProperty("portablerestclient.workspace");
-            if (override != null && !override.isBlank()) return Path.of(override).toAbsolutePath();
-            return appDir().resolve("data").resolve("workspace.json");
+        /**
+         * The workspace folder: -Dworkspace.folder=<folder> (a relative one is resolved against the app folder,
+         * so a portable copy can point next to itself), else the app folder's data subfolder.
+         */
+        static Path workspaceFolder() {
+            String folder = System.getProperty("workspace.folder");
+            if (folder != null && !folder.isBlank()) return appDir().resolve(folder.strip()).normalize();
+            return appDir().resolve("data");
         }
 
         /**
@@ -640,10 +650,15 @@ public class PortableRestClient {
         }
 
         static void save(Workspace w, Path file) throws IOException {
+            writeAtomically(file, Json.pretty(toJson(w)));
+        }
+
+        /** Writes a temp file and renames it over the target, so a crash never leaves a half-written file. */
+        static void writeAtomically(Path file, String text) throws IOException {
             Path target = file.toAbsolutePath();
             Files.createDirectories(target.getParent());
             Path tmp = target.resolveSibling(target.getFileName() + ".tmp");
-            Files.writeString(tmp, Json.pretty(toJson(w)), StandardCharsets.UTF_8);
+            Files.writeString(tmp, text, StandardCharsets.UTF_8);
             try {
                 Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
             } catch (AtomicMoveNotSupportedException e) {
@@ -651,9 +666,20 @@ public class PortableRestClient {
             }
         }
 
+        /** The single-file format: settings, state, and every collection and environment inline. */
         static Map<String, Object> toJson(Workspace w) {
+            return toJson(w, "portable-rest-client-workspace",
+                    w.collections.stream().map(Storage::item).toList(),
+                    w.environments.stream().map(Storage::env).toList());
+        }
+
+        /**
+         * Settings and state, with {@code collections} and {@code environments} as given: the objects themselves
+         * in workspace.json, their file names in a split workspace's settings.json.
+         */
+        static Map<String, Object> toJson(Workspace w, String format, List<?> collections, List<?> environments) {
             Map<String, Object> m = new LinkedHashMap<>();
-            m.put("format", "portable-rest-client-workspace");
+            m.put("format", format);
             m.put("version", 1);
             m.put("activeEnvironment", w.activeEnvironment);
             Map<String, Object> s = new LinkedHashMap<>();
@@ -663,12 +689,13 @@ public class PortableRestClient {
             s.put("insecureTls", w.settings.insecureTls);
             s.put("curlVerbose", w.settings.curlVerbose);
             s.put("curlMultiline", w.settings.curlMultiline);
+            s.put("storage", w.settings.splitStorage ? "split" : "single");
             m.put("settings", s);
             if (w.window != null) m.put("window", Arrays.stream(w.window).boxed().toList());
             if (w.treeScrollX > 0) m.put("treeScrollX", w.treeScrollX);
             if (!w.downloadDir.isEmpty()) m.put("downloadDir", w.downloadDir);
-            m.put("collections", w.collections.stream().map(Storage::item).toList());
-            m.put("environments", w.environments.stream().map(Storage::env).toList());
+            m.put("collections", collections);
+            m.put("environments", environments);
             if (!w.openTabs.isEmpty()) {
                 Map<String, Object> session = new LinkedHashMap<>();
                 session.put("selected", w.selectedTab);
@@ -687,6 +714,17 @@ public class PortableRestClient {
         }
 
         static Workspace fromJson(Map<String, Object> m) {
+            Workspace w = stateFromJson(m);
+            for (Object o : Json.arr(m.get("collections"))) {
+                Item it = item(Json.obj(o));
+                if (it instanceof Collection c) w.collections.add(c);
+            }
+            for (Object o : Json.arr(m.get("environments"))) w.environments.add(env(Json.obj(o)));
+            return w;
+        }
+
+        /** Everything but the collections and environments, which a split workspace keeps in their own files. */
+        static Workspace stateFromJson(Map<String, Object> m) {
             Workspace w = new Workspace();
             w.activeEnvironment = Json.str(m.get("activeEnvironment"));
             Map<String, Object> s = Json.obj(m.get("settings"));
@@ -696,15 +734,12 @@ public class PortableRestClient {
             w.settings.insecureTls = Json.bool(s.get("insecureTls"), false);
             w.settings.curlVerbose = Json.bool(s.get("curlVerbose"), false);
             w.settings.curlMultiline = Json.bool(s.get("curlMultiline"), true);
+            // Files from before the option have no key, and they are all single workspace.json files.
+            w.settings.splitStorage = Json.str(s.get("storage")).equals("split");
             List<Object> win = Json.arr(m.get("window"));
             if (win.size() >= 4) w.window = win.stream().mapToInt(o -> Json.integer(o, 0)).toArray();
             w.treeScrollX = Math.max(0, Json.integer(m.get("treeScrollX"), 0));
             w.downloadDir = Json.str(m.get("downloadDir"));
-            for (Object o : Json.arr(m.get("collections"))) {
-                Item it = item(Json.obj(o));
-                if (it instanceof Collection c) w.collections.add(c);
-            }
-            for (Object o : Json.arr(m.get("environments"))) w.environments.add(env(Json.obj(o)));
             Map<String, Object> session = Json.obj(m.get("session"));
             w.selectedTab = Json.str(session.get("selected"));
             for (Object o : Json.arr(session.get("tabs"))) {
@@ -823,6 +858,270 @@ public class PortableRestClient {
         /** True when the two requests would be saved identically; that is what "no unsaved changes" means. */
         static boolean sameContent(Request a, Request b) {
             return Json.write(item(a)).equals(Json.write(item(b)));
+        }
+    }
+
+    /**
+     * The workspace in its data folder, in one of two layouts:
+     * <ul>
+     * <li>single: everything in workspace.json;</li>
+     * <li>split: settings.json (settings, state, open tabs, and the order of the other files), plus
+     *     collections\*.json and environments\*.json, one file per collection and environment.</li>
+     * </ul>
+     * When settings.json exists, its "storage" setting says which layout is active (a split workspace switched to single
+     * keeps its settings.json, marked single). Otherwise a workspace.json means single, and neither means a first run: split.
+     * <p>
+     * A split workspace rewrites only the files whose content changed, and a save of the session alone (tab switches,
+     * typing in a draft) serializes and writes settings.json only.
+     */
+    static final class WorkspaceStore {
+        static final String SETTINGS_FORMAT = "portable-rest-client-settings";
+
+        /** A workspace.json or settings.json that could not be read; the caller decides what to do with it. */
+        static final class UnreadableFile extends IOException {
+            final Path file;
+
+            UnreadableFile(Path file, Exception cause) {
+                super(file + ": " + cause.getMessage(), cause);
+                this.file = file;
+            }
+        }
+
+        /** The workspace folder ({@link Storage#workspaceFolder}); both layouts live in it. */
+        final Path dir;
+        /** The single-file layout's workspace.json in that folder. */
+        final Path single;
+        /** Pretty JSON of each file as last read or written: a file whose new text matches is not rewritten. */
+        private final Map<Path, String> known = new HashMap<>();
+        /** What a load skipped without failing (an unreadable collection file, set aside), to tell the user. */
+        final List<String> problems = new ArrayList<>();
+
+        WorkspaceStore(Path folder) {
+            dir = folder.toAbsolutePath();
+            single = dir.resolve("workspace.json");
+        }
+
+        Path settingsFile() { return dir.resolve("settings.json"); }
+        Path collectionsDir() { return dir.resolve("collections"); }
+        Path environmentsDir() { return dir.resolve("environments"); }
+
+        /** Where the workspace lives, for the status bar. */
+        String describe(boolean split) { return split ? dir + " (multiple files)" : single.toString(); }
+
+        Workspace load() throws IOException {
+            known.clear();
+            problems.clear();
+            Path settings = settingsFile();
+            if (Files.exists(settings)) {
+                Map<String, Object> m = readJson(settings);
+                return Json.str(Json.obj(m.get("settings")).get("storage")).equals("single") ? loadSingle() : loadSplit(m);
+            }
+            if (Files.exists(single)) return loadSingle();
+            return loadSplit(Map.of()); // a first run, or a split workspace whose settings.json was lost
+        }
+
+        /** Saves in the layout the workspace's settings name. {@code data} false: only settings or state changed. */
+        void save(Workspace w, boolean data) throws IOException {
+            if (w.settings.splitStorage) saveSplit(w, data);
+            else write(single, Storage.toJson(w));
+        }
+
+        /**
+         * Makes the other layout the active one. With {@code migrate} the workspace is written in it, overwriting what
+         * is there. Without, the current workspace is saved where it is, and its collections, environments and open
+         * tabs are replaced by the ones stored in the other layout (none if there are none); settings and window state stay.
+         */
+        void switchTo(Workspace w, boolean split, boolean migrate) throws IOException {
+            if (split == w.settings.splitStorage) return;
+            problems.clear();
+            // Read before writing anything, so a failure leaves both layouts as they were.
+            Workspace other = migrate ? null : split ? loadSplitForSwitch() : loadSingle();
+            boolean was = w.settings.splitStorage;
+            try {
+                // Leaving single: workspace.json is saved as it is; settings.json, written below, makes split active.
+                if (split) write(single, Storage.toJson(w));
+                w.settings.splitStorage = split;
+                // Leaving split: settings.json stays with its data, but now names single as the active layout.
+                if (!split) saveSplit(w, true);
+                if (migrate) {
+                    known.clear(); // overwrite, even where a file looks unchanged
+                    save(w, true);
+                    return;
+                }
+            } catch (IOException | RuntimeException e) {
+                w.settings.splitStorage = was;
+                throw e;
+            }
+            w.collections.clear();
+            w.collections.addAll(other.collections);
+            w.environments.clear();
+            w.environments.addAll(other.environments);
+            w.activeEnvironment = other.activeEnvironment;
+            w.openTabs.clear();
+            w.openTabs.addAll(other.openTabs);
+            w.selectedTab = other.selectedTab;
+            save(w, true);
+        }
+
+        /** The files a migration to this layout would overwrite. */
+        List<Path> existingFiles(boolean split) throws IOException {
+            List<Path> out = new ArrayList<>();
+            if (!split) {
+                if (Files.exists(single)) out.add(single);
+                return out;
+            }
+            if (Files.exists(settingsFile())) out.add(settingsFile());
+            out.addAll(jsonFiles(collectionsDir()));
+            out.addAll(jsonFiles(environmentsDir()));
+            return out;
+        }
+
+        // ------------------------------------------------------------ single
+
+        private Workspace loadSingle() throws IOException {
+            Workspace w = Files.exists(single) ? Storage.fromJson(readJson(single)) : new Workspace();
+            w.settings.splitStorage = false;
+            known.put(single, Json.pretty(Storage.toJson(w)));
+            return w;
+        }
+
+        // ------------------------------------------------------------ split
+
+        private Workspace loadSplitForSwitch() throws IOException {
+            return loadSplit(Files.exists(settingsFile()) ? readJson(settingsFile()) : Map.of());
+        }
+
+        /** Listed files in settings.json's order, then any others in the folders, so a lost list loses no collection. */
+        private Workspace loadSplit(Map<String, Object> m) throws IOException {
+            Workspace w = Storage.stateFromJson(m);
+            w.settings.splitStorage = true;
+            for (Path p : ordered(collectionsDir(), Json.arr(m.get("collections")))) {
+                Map<String, Object> json = readPart(p);
+                if (json == null) continue;
+                if (Storage.item(json) instanceof Collection c) {
+                    w.collections.add(c);
+                    known.put(p, Json.pretty(Storage.item(c)));
+                } else {
+                    problems.add(p.getFileName() + " in " + p.getParent() + " is not a collection; it was skipped.");
+                }
+            }
+            for (Path p : ordered(environmentsDir(), Json.arr(m.get("environments")))) {
+                Map<String, Object> json = readPart(p);
+                if (json == null) continue;
+                Environment e = Storage.env(json);
+                w.environments.add(e);
+                known.put(p, Json.pretty(Storage.env(e)));
+            }
+            return w;
+        }
+
+        private void saveSplit(Workspace w, boolean data) throws IOException {
+            List<String> collections = fileNames(w.collections.stream().map(c -> c.name).toList());
+            List<String> environments = fileNames(w.environments.stream().map(e -> e.name).toList());
+            // Collections and environments first: if a write fails, settings.json still lists only files that exist.
+            if (data) {
+                for (int i = 0; i < collections.size(); i++)
+                    write(collectionsDir().resolve(collections.get(i)), Storage.item(w.collections.get(i)));
+                for (int i = 0; i < environments.size(); i++)
+                    write(environmentsDir().resolve(environments.get(i)), Storage.env(w.environments.get(i)));
+            }
+            write(settingsFile(), Storage.toJson(w, SETTINGS_FORMAT, collections, environments));
+            if (data) {
+                removeOthers(collectionsDir(), collections);
+                removeOthers(environmentsDir(), environments);
+            }
+        }
+
+        /**
+         * File names for these collection or environment names: Windows-safe, and unique ignoring case,
+         * so "API" and "api" become "API.json" and "api (2).json".
+         */
+        static List<String> fileNames(List<String> names) {
+            List<String> out = new ArrayList<>();
+            Set<String> used = new HashSet<>();
+            for (String name : names) {
+                String base = name.replace('/', '_').replace('\\', '_');
+                if (base.length() > 80) base = base.substring(0, 80);
+                base = Engine.safeFileName(base);
+                if (base.isEmpty()) base = "unnamed";
+                String n = base;
+                for (int i = 2; !used.add(n.toLowerCase(Locale.ROOT)); i++) n = base + " (" + i + ")";
+                out.add(n + ".json");
+            }
+            return out;
+        }
+
+        /** The listed files that exist (plain names only), then the folder's other .json files by name. */
+        private static List<Path> ordered(Path folder, List<Object> listed) throws IOException {
+            List<Path> out = new ArrayList<>();
+            Set<String> seen = new HashSet<>();
+            for (Object o : listed) {
+                String name = Json.str(o);
+                if (name.isEmpty() || !Path.of(name).getFileName().toString().equals(name)) continue;
+                Path p = folder.resolve(name);
+                if (Files.isRegularFile(p) && seen.add(name.toLowerCase(Locale.ROOT))) out.add(p);
+            }
+            for (Path p : jsonFiles(folder))
+                if (seen.add(p.getFileName().toString().toLowerCase(Locale.ROOT))) out.add(p);
+            return out;
+        }
+
+        private static List<Path> jsonFiles(Path folder) throws IOException {
+            if (!Files.isDirectory(folder)) return List.of();
+            try (var s = Files.list(folder)) {
+                return s.filter(p -> p.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".json") && Files.isRegularFile(p))
+                        .sorted(Comparator.comparing(p -> p.getFileName().toString().toLowerCase(Locale.ROOT)))
+                        .toList();
+            }
+        }
+
+        /** Deletes the .json files no collection or environment maps to any more: renamed, deleted, or migrated over. */
+        private void removeOthers(Path folder, List<String> keep) throws IOException {
+            Set<String> names = new HashSet<>();
+            for (String k : keep) names.add(k.toLowerCase(Locale.ROOT));
+            for (Path p : jsonFiles(folder)) {
+                if (names.contains(p.getFileName().toString().toLowerCase(Locale.ROOT))) continue;
+                Files.deleteIfExists(p);
+                known.remove(p);
+            }
+        }
+
+        /**
+         * A collection or environment file, or null when it can't be read: it is then renamed aside, so it is neither
+         * loaded again nor deleted as stale. If it can't be renamed either, the whole load fails rather than risk it.
+         */
+        private Map<String, Object> readPart(Path p) throws IOException {
+            try {
+                return readJson(p);
+            } catch (UnreadableFile e) {
+                Path aside = p.resolveSibling(p.getFileName() + ".broken-" + System.currentTimeMillis());
+                try {
+                    Files.move(p, aside);
+                } catch (IOException moveError) {
+                    throw e;
+                }
+                problems.add("Could not read " + p + ":\n" + e.getCause().getMessage() + "\nIt was renamed to " + aside.getFileName() + ".");
+                return null;
+            }
+        }
+
+        // ------------------------------------------------------------ files
+
+        private static Map<String, Object> readJson(Path p) throws UnreadableFile {
+            try {
+                Object parsed = Json.parse(Files.readString(p, StandardCharsets.UTF_8));
+                if (!(parsed instanceof Map)) throw new JsonException("not a JSON object");
+                return Json.obj(parsed);
+            } catch (IOException | RuntimeException e) {
+                throw new UnreadableFile(p, e);
+            }
+        }
+
+        private void write(Path p, Map<String, Object> json) throws IOException {
+            String text = Json.pretty(json);
+            if (text.equals(known.get(p))) return;
+            Storage.writeAtomically(p, text);
+            known.put(p, text);
         }
     }
 
@@ -2425,10 +2724,15 @@ public class PortableRestClient {
         static final int DISPLAY_LIMIT = 10 * 1024 * 1024;
         static final Font MONO = monoFont();
 
-        final Path file;
+        final WorkspaceStore store;
         Workspace ws;
         String loadProblem;
         boolean saveDisabled;
+        /**
+         * Collections or environments may have changed since the last save. Without it a save writes only the settings
+         * and session (in a split workspace, settings.json alone): tab switches and typing in a draft don't rewrite collections.
+         */
+        boolean dataChanged;
         final JFrame frame = new JFrame(APP);
         final DefaultMutableTreeNode root = new DefaultMutableTreeNode();
         final DefaultTreeModel treeModel = new DefaultTreeModel(root);
@@ -2467,23 +2771,32 @@ public class PortableRestClient {
         /** Where the multipart file chooser opens; remembered for the session only. */
         File uploadDir;
 
-        Ui(Path file) {
-            this.file = file;
+        Ui(Path folder) {
+            store = new WorkspaceStore(folder);
             try {
-                ws = Storage.load(file);
+                ws = store.load();
             } catch (Exception e) {
-                ws = new Workspace();
-                Path aside = file.resolveSibling(file.getFileName() + ".broken-" + System.currentTimeMillis());
+                Path bad = e instanceof WorkspaceStore.UnreadableFile u ? u.file : store.single;
+                String why = e instanceof WorkspaceStore.UnreadableFile ? e.getCause().getMessage() : e.toString();
+                Path aside = bad.resolveSibling(bad.getFileName() + ".broken-" + System.currentTimeMillis());
                 try {
-                    Files.move(file, aside);
-                    loadProblem = "Could not read " + file + ":\n" + e.getMessage()
-                            + "\n\nThe file was renamed to " + aside.getFileName() + " and an empty workspace was started.";
-                } catch (IOException moveError) {
+                    Files.move(bad, aside);
+                    loadProblem = "Could not read " + bad + ":\n" + why + "\n\nThe file was renamed to " + aside.getFileName() + ".";
+                    // Without settings.json the collection and environment files still load; without workspace.json nothing is left.
+                    ws = bad.equals(store.single) ? null : store.load();
+                } catch (Exception again) {
                     saveDisabled = true;
-                    loadProblem = "Could not read " + file + ":\n" + e.getMessage()
-                            + "\n\nSaving is disabled for this session so the file is not overwritten.";
+                    loadProblem = "Could not read " + bad + ":\n" + why
+                            + "\n\nSaving is disabled for this session so no file is overwritten.";
+                }
+                if (ws == null) {
+                    ws = new Workspace();
+                    ws.settings.splitStorage = !bad.equals(store.single);
+                    if (!saveDisabled) loadProblem += " An empty workspace was started.";
                 }
             }
+            if (!store.problems.isEmpty())
+                loadProblem = (loadProblem == null ? "" : loadProblem + "\n\n") + String.join("\n\n", store.problems);
         }
 
         static Font monoFont() {
@@ -2592,7 +2905,7 @@ public class PortableRestClient {
                 // After layout, so the scroll bar's range is known; setValue clamps a position that no longer fits.
                 treeScroll.getHorizontalScrollBar().setValue(ws.treeScrollX);
             });
-            statusBar.setText("Workspace: " + file);
+            statusBar.setText("Workspace: " + store.describe(ws.settings.splitStorage));
             if (loadProblem != null) JOptionPane.showMessageDialog(frame, loadProblem, APP, JOptionPane.WARNING_MESSAGE);
         }
 
@@ -2736,6 +3049,7 @@ public class PortableRestClient {
         // ---------------------------------------------------------------- persistence
 
         void changed() {
+            dataChanged = true;
             saveTimer.restart();
             highlightTimer.restart(); // also covers environment switches and variable edits, which all come through here
             if (current() != null) current().editor.refreshCurl();
@@ -2746,8 +3060,9 @@ public class PortableRestClient {
             if (saveDisabled) return;
             syncSession();
             try {
-                Storage.save(ws, file);
-                statusBar.setText("Saved " + file);
+                store.save(ws, dataChanged);
+                dataChanged = false;
+                statusBar.setText("Saved " + store.describe(ws.settings.splitStorage));
                 lastSaveError = null;
             } catch (IOException e) {
                 String msg = e.toString();
@@ -2769,6 +3084,7 @@ public class PortableRestClient {
             else ws.window = new int[] {b.x, b.y, b.width, b.height, max ? 1 : 0};
             ws.treeScrollX = treeScroll.getHorizontalScrollBar().getValue();
             for (CompletableFuture<Response> f : inFlight.values()) f.cancel(true);
+            dataChanged = true; // a last full save, in case a change didn't come through changed()
             save();
             frame.dispose();
             System.exit(0);
@@ -3117,6 +3433,9 @@ public class PortableRestClient {
             south.add(button("Close", d::dispose));
             content.add(south, BorderLayout.SOUTH);
             d.setContentPane(content);
+            // In-window binding: a table cell being edited takes Esc first (cancels the edit), so the next Esc closes.
+            d.getRootPane().registerKeyboardAction(e -> d.dispose(),
+                    KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), JComponent.WHEN_IN_FOCUSED_WINDOW);
             Environment active = ws.activeEnv();
             if (active != null) list.setSelectedValue(active, true);
             else if (!model.isEmpty()) list.setSelectedIndex(0);
@@ -3162,14 +3481,125 @@ public class PortableRestClient {
             p.add(redirects);
             p.add(http2);
             p.add(insecure);
-            if (JOptionPane.showConfirmDialog(frame, p, "Settings", JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE)
+
+            JRadioButton single = new JRadioButton("One file (workspace.json)", !s.splitStorage);
+            JRadioButton split = new JRadioButton("Multiple files (settings.json, collections\\, environments\\)", s.splitStorage);
+            ButtonGroup layout = new ButtonGroup();
+            layout.add(single);
+            layout.add(split);
+            JCheckBox migrate = new JCheckBox("Migrate workspace: write the current workspace in the new format");
+            JLabel hint = new JLabel();
+            hint.setForeground(Color.GRAY);
+            hint.setBorder(BorderFactory.createEmptyBorder(0, 26, 0, 0));
+            List<String> hints = List.of("In " + store.dir, "Files already stored in the new format will be overwritten.",
+                    "Without migration, the workspace already stored in that format is opened (empty if there is none).");
+            // The dialog is sized once, so the label must fit its longest text from the start.
+            int width = 0;
+            for (String h : hints) {
+                hint.setText(h);
+                width = Math.max(width, hint.getPreferredSize().width);
+            }
+            hint.setPreferredSize(new Dimension(width, hint.getPreferredSize().height));
+            Runnable sync = () -> {
+                boolean changing = split.isSelected() != s.splitStorage;
+                migrate.setEnabled(changing);
+                if (!changing) migrate.setSelected(false);
+                hint.setText(hints.get(!changing ? 0 : migrate.isSelected() ? 1 : 2));
+            };
+            single.addActionListener(e -> sync.run());
+            split.addActionListener(e -> sync.run());
+            migrate.addActionListener(e -> sync.run());
+            sync.run();
+            if (saveDisabled) {
+                single.setEnabled(false);
+                split.setEnabled(false);
+                hint.setText("Saving is disabled for this session.");
+            }
+            migrate.setBorder(BorderFactory.createEmptyBorder(0, 22, 0, 0));
+            JPanel storage = new JPanel(new GridLayout(0, 1, 0, 2));
+            storage.setBorder(BorderFactory.createCompoundBorder(
+                    BorderFactory.createTitledBorder("Workspace storage"), BorderFactory.createEmptyBorder(2, 4, 4, 4)));
+            storage.add(single);
+            storage.add(split);
+            storage.add(migrate);
+            storage.add(hint);
+            JPanel all = new JPanel(new BorderLayout(0, 12));
+            all.add(p, BorderLayout.NORTH);
+            all.add(storage, BorderLayout.CENTER);
+
+            if (JOptionPane.showConfirmDialog(frame, all, "Settings", JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE)
                     != JOptionPane.OK_OPTION) return;
+            boolean toSplit = split.isSelected();
+            boolean switchLayout = toSplit != s.splitStorage;
+            if (switchLayout && migrate.isSelected() && !confirmMigration(toSplit)) return;
             s.timeoutSeconds = (Integer) timeout.getValue();
             s.followRedirects = redirects.isSelected();
             s.http2 = http2.isSelected();
             s.insecureTls = insecure.isSelected();
             insecureBox.setSelected(s.insecureTls);
+            if (switchLayout) switchStorage(toSplit, migrate.isSelected());
             changed();
+        }
+
+        /** Warns that migrating overwrites the files already stored in the target format; true to go ahead. */
+        boolean confirmMigration(boolean toSplit) {
+            List<Path> existing;
+            try {
+                existing = store.existingFiles(toSplit);
+            } catch (IOException e) {
+                existing = List.of();
+            }
+            StringBuilder b = new StringBuilder("The current workspace will be written as ")
+                    .append(toSplit ? "multiple files" : "one file").append(" to\n").append(store.dir).append("\n\n");
+            if (existing.isEmpty()) {
+                b.append("Existing files there will be overwritten.");
+            } else {
+                b.append("These existing files will be overwritten").append(toSplit ? " or deleted" : "").append(":\n");
+                for (Path f : existing.subList(0, Math.min(12, existing.size()))) b.append("    ").append(store.dir.relativize(f)).append('\n');
+                if (existing.size() > 12) b.append("    … and ").append(existing.size() - 12).append(" more\n");
+            }
+            b.append("\nContinue?");
+            return JOptionPane.showConfirmDialog(frame, b.toString(), "Migrate workspace", JOptionPane.OK_CANCEL_OPTION,
+                    JOptionPane.WARNING_MESSAGE) == JOptionPane.OK_OPTION;
+        }
+
+        /** Changes the workspace layout; see {@link WorkspaceStore#switchTo}. */
+        void switchStorage(boolean toSplit, boolean migrate) {
+            saveTimer.stop();
+            commitAll();
+            syncSession(); // the open tabs and their drafts stay with the layout being left (or move along when migrating)
+            try {
+                store.switchTo(ws, toSplit, migrate);
+            } catch (IOException | RuntimeException e) {
+                JOptionPane.showMessageDialog(frame, "Could not switch the workspace storage:\n" + e.getMessage(), APP,
+                        JOptionPane.ERROR_MESSAGE);
+                return;
+            }
+            dataChanged = false;
+            if (!migrate) reloadWorkspace();
+            statusBar.setText((migrate ? "Migrated the workspace to " : "Opened the workspace in ") + store.describe(toSplit));
+            if (!store.problems.isEmpty())
+                JOptionPane.showMessageDialog(frame, String.join("\n\n", store.problems), APP, JOptionPane.WARNING_MESSAGE);
+        }
+
+        /** Shows the workspace afresh after its collections, environments and open tabs were replaced. */
+        void reloadWorkspace() {
+            for (CompletableFuture<Response> f : inFlight.values()) f.cancel(true);
+            inFlight.clear(); // finished() then ignores the cancelled sends
+            results.clear();
+            for (RequestTab t : List.copyOf(openTabs)) removeTab(t);
+            switching = true;
+            try {
+                root.removeAllChildren();
+                for (Collection c : ws.collections) root.add(buildNode(c));
+                treeModel.reload();
+                for (int i = 0; i < root.getChildCount(); i++)
+                    tree.expandPath(new TreePath(((DefaultMutableTreeNode) root.getChildAt(i)).getPath()));
+            } finally {
+                switching = false;
+            }
+            refreshEnvCombo();
+            restoreTabs();
         }
 
         // ---------------------------------------------------------------- import
@@ -3533,6 +3963,7 @@ public class PortableRestClient {
             t.updateHeader();
             t.editor.updateSaveButton();
             treeModel.nodeChanged(t.node);
+            dataChanged = true;
             save();
         }
 
@@ -3548,6 +3979,7 @@ public class PortableRestClient {
                     treeModel.nodeChanged(t.node);
                 }
             }
+            dataChanged = true;
             save();
         }
 
