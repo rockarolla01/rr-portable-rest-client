@@ -45,6 +45,11 @@ Below is a detailed, AI-generated overview.
 - Query parameters stay in sync with the URL in both directions. Disabled params are kept but not sent.
 - Request headers, each with an enabled checkbox.
 - Request body: none, plain text, JSON (with a "Format JSON" button), or `x-www-form-urlencoded` form fields (a key/value table with enabled checkboxes; keys and values are encoded for you).
+- **Multipart (form-data)** bodies for file uploads. Each part has a name, a **Text** / **File** type and a value; switching a part to File opens a file chooser, and **Browse…** in the cell changes the file.
+  - The **…** button on a part edits headers sent with that part only (for example `Content-Type: application/json` on a text part); it shows how many are set.
+  - `Content-Disposition` is generated, and a file part gets a `Content-Type` guessed from its extension, unless you set them yourself.
+  - Files are read while sending, not when saved. A relative path is taken from the app folder (files you pick inside it are stored that way), so a portable copy can carry its upload files.
+  - Variables work in part names, text values, file paths and part headers.
 - The request and response body editors have line numbers, and the line with the cursor is highlighted.
 - **Ctrl+F** in either body opens a find bar. All matches are highlighted, with a count such as "3 of 12", and the search isn't case-sensitive unless you tick **Match case**.
   - **Enter** / **Shift+Enter** (or **F3** / **Shift+F3**) step forward and back, wrapping around.
@@ -61,7 +66,7 @@ Below is a detailed, AI-generated overview.
     - A name without an extension gets one from the `Content-Type` (e.g. `application/pdf` → `.pdf`). For generic types such as `application/octet-stream` or `text/plain`, the extension in the URL (`…/archive.zip`) is used instead. If neither helps, it's `.txt`.
 - Post-processing: after a 2xx response, store the whole body, or a value at a JSON path such as `data.items[0].id`, in an environment variable.
 - Postman import of collections (v2.0 and v2.1) and environments. Unsupported parts are skipped and listed in a report.
-  - Raw (text/JSON) and `urlencoded` bodies are imported.
+  - Raw (text/JSON), `urlencoded` and `formdata` (multipart) bodies are imported. Check the file paths of file parts afterwards: Postman may store them relative to its own working folder.
   - Bearer, basic and API-key auth are converted into headers or params.
   - Simple `pm.environment.set(..., pm.response.json()...)` test scripts become post-processing rules.
 - **Ignore SSL errors**, like `curl -k`, from a checkbox in the toolbar (also in Settings).
@@ -110,9 +115,9 @@ To use a different file, add `-Dportablerestclient.workspace=C:\path\to\workspac
 - **F2** / **Delete** on the tree: rename or delete.
 - **Delete** in a table: remove the selected rows.
 - **Ctrl+Z** / **Ctrl+Y** in the body editor or the URL field: undo / redo, separately in each tab. A URL change made from the Params table undoes as one step.
-- **Ctrl+Z** / **Ctrl+Y** in a table (Params, Headers, Form, Post-processing, variables): undo / redo cell edits, added rows and removed rows. While a cell is being edited, Ctrl+Z first discards the typed text. Saving keeps the history; closing the tab discards it.
+- **Ctrl+Z** / **Ctrl+Y** in a table (Params, Headers, Form, Multipart, Post-processing, variables): undo / redo cell edits, added rows and removed rows. While a cell is being edited, Ctrl+Z first discards the typed text. Saving keeps the history; closing the tab discards it.
 - **Ctrl+F** in the request or response body: find. **Enter** / **Shift+Enter** or **F3** / **Shift+F3** for the next / previous match; **Esc** closes the find bar.
 
 ## Not supported
 
-Postman scripts (other than the simple variable-setting pattern), multipart form-data and file bodies, other auth types (OAuth, digest, …), cookie management, WebSocket/GraphQL, and export back to Postman.
+Postman scripts (other than the simple variable-setting pattern), binary file bodies, other auth types (OAuth, digest, …), cookie management, WebSocket/GraphQL, and export back to Postman.
