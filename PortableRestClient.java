@@ -474,6 +474,8 @@ public class PortableRestClient {
         final Settings settings = new Settings();
         /** x, y, width, height, maximized(0/1); null until the window has been closed once. */
         int[] window;
+        /** Horizontal scroll position of the collections tree, so long names stay scrolled as they were left. */
+        int treeScrollX;
         /** Open request tabs in strip order, and the id of the selected one. */
         final List<OpenTab> openTabs = new ArrayList<>();
         String selectedTab = "";
@@ -636,6 +638,7 @@ public class PortableRestClient {
             s.put("curlMultiline", w.settings.curlMultiline);
             m.put("settings", s);
             if (w.window != null) m.put("window", Arrays.stream(w.window).boxed().toList());
+            if (w.treeScrollX > 0) m.put("treeScrollX", w.treeScrollX);
             m.put("collections", w.collections.stream().map(Storage::item).toList());
             m.put("environments", w.environments.stream().map(Storage::env).toList());
             if (!w.openTabs.isEmpty()) {
@@ -667,6 +670,7 @@ public class PortableRestClient {
             w.settings.curlMultiline = Json.bool(s.get("curlMultiline"), true);
             List<Object> win = Json.arr(m.get("window"));
             if (win.size() >= 4) w.window = win.stream().mapToInt(o -> Json.integer(o, 0)).toArray();
+            w.treeScrollX = Math.max(0, Json.integer(m.get("treeScrollX"), 0));
             for (Object o : Json.arr(m.get("collections"))) {
                 Item it = item(Json.obj(o));
                 if (it instanceof Collection c) w.collections.add(c);
@@ -2032,6 +2036,7 @@ public class PortableRestClient {
         final DefaultMutableTreeNode root = new DefaultMutableTreeNode();
         final DefaultTreeModel treeModel = new DefaultTreeModel(root);
         final JTree tree = new JTree(treeModel);
+        final JScrollPane treeScroll = new JScrollPane(tree);
         final JComboBox<String> envCombo = new JComboBox<>();
         final JCheckBox insecureBox = new JCheckBox("Ignore SSL errors");
         final JLabel statusBar = new JLabel(" ");
@@ -2154,7 +2159,6 @@ public class PortableRestClient {
             JSplitPane right = new JSplitPane(JSplitPane.VERTICAL_SPLIT, buildEditorArea(), responseView.panel);
             right.setResizeWeight(0.45);
             right.setContinuousLayout(true);
-            JScrollPane treeScroll = new JScrollPane(tree);
             treeScroll.setMinimumSize(new Dimension(150, 100));
             JSplitPane main = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, treeScroll, right);
             main.setDividerLocation(290);
@@ -2184,7 +2188,11 @@ public class PortableRestClient {
             restoreTabs();
             restoreBounds();
             frame.setVisible(true);
-            SwingUtilities.invokeLater(() -> right.setDividerLocation(0.45));
+            SwingUtilities.invokeLater(() -> {
+                right.setDividerLocation(0.45);
+                // After layout, so the scroll bar's range is known; setValue clamps a position that no longer fits.
+                treeScroll.getHorizontalScrollBar().setValue(ws.treeScrollX);
+            });
             statusBar.setText("Workspace: " + file);
             if (loadProblem != null) JOptionPane.showMessageDialog(frame, loadProblem, APP, JOptionPane.WARNING_MESSAGE);
         }
@@ -2360,6 +2368,7 @@ public class PortableRestClient {
             if (max && ws.window != null && ws.window.length >= 4)
                 ws.window = new int[] {ws.window[0], ws.window[1], ws.window[2], ws.window[3], 1};
             else ws.window = new int[] {b.x, b.y, b.width, b.height, max ? 1 : 0};
+            ws.treeScrollX = treeScroll.getHorizontalScrollBar().getValue();
             for (CompletableFuture<Response> f : inFlight.values()) f.cancel(true);
             save();
             frame.dispose();
@@ -2399,7 +2408,14 @@ public class PortableRestClient {
         void select(DefaultMutableTreeNode n) {
             TreePath p = new TreePath(n.getPath());
             tree.setSelectionPath(p);
-            tree.scrollPathToVisible(p);
+            tree.makeVisible(p);
+            // scrollPathToVisible would also scroll sideways to a deep node's indent, which made the
+            // horizontal position jump on startup and on every tab switch; only scroll vertically.
+            Rectangle r = tree.getPathBounds(p);
+            if (r != null) {
+                Rectangle view = treeScroll.getViewport().getViewRect();
+                tree.scrollRectToVisible(new Rectangle(view.x, r.y, view.width, r.height));
+            }
         }
 
         Collection collectionOf(DefaultMutableTreeNode n) {
@@ -4140,6 +4156,9 @@ public class PortableRestClient {
                     "{\"collections\":[{\"type\":\"collection\",\"name\":\"c\",\"items\":[{\"type\":\"request\",\"name\":\"r\"}]}]}")));
             check("missing id is generated", !((Request) legacy.collections.get(0).items.get(0)).id.isEmpty());
             check("no session by default", legacy.openTabs.isEmpty() && !Storage.toJson(legacy).containsKey("session"));
+            check("tree scroll defaults to left", legacy.treeScrollX == 0 && !Storage.toJson(legacy).containsKey("treeScrollX"));
+            legacy.treeScrollX = 57;
+            eq("tree scroll round trip", 57, Storage.fromJson(Storage.toJson(legacy)).treeScrollX);
 
             w.openTabs.add(new OpenTab(original.id, false, copy));
             w.openTabs.add(new OpenTab("gone", true, null));

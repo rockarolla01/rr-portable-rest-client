@@ -49,6 +49,7 @@ Sections inside `PortableRestClient.java`, in this order:
    - Saves write a temp file and then do an atomic rename.
    - `Storage.copy` deep-copies an item by serializing it and reading it back. It keeps request ids; `freshIds` gives a duplicate new ones.
    - `sameContent(a, b)` compares the serialized forms; it is the "unsaved changes" test.
+   - `treeScrollX` (the collections tree's horizontal scroll position) is saved on exit and restored after the first layout. `Ui.select` scrolls the tree only vertically, so selecting a deep node never moves it sideways.
    - The tab session goes under a `"session"` key (`selected`, `tabs[{id, preview, draft?}]`), written only when tabs are open.
 6. `PostmanImporter`: Postman collection v2.0/v2.1 and environment exports. Returns an `ImportResult` that includes the skipped-features report.
 7. `Response`, `Engine`: variable resolution, `prepare` (builds the URI and headers), async `send` (cancellable), response decoding, `applyPostActions`.
