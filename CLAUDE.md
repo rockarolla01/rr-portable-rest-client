@@ -22,6 +22,7 @@ Status: implemented (v1.0). `README.md` has the user-facing feature list.
 ```
 PortableRestClient.java   whole application (~4,050 lines)
 test/SelfTest.java        self-tests (~630 lines)
+test/run.ps1              compiles app + tests into build\test and runs them
 README.md
 ```
 
@@ -72,6 +73,7 @@ $J = "C:\Soft\jdk-25.0.5.0.2+1\bin"
 & "$J\java.exe" PortableRestClient.java              # run from source, no build step
 
 # self-tests (exit code != 0 on failure); build/ is git-ignored
+powershell -ExecutionPolicy Bypass -File test\run.ps1   # same as the two lines below
 & "$J\javac.exe" -Xlint:all,-serial -d build\test PortableRestClient.java test\SelfTest.java
 & "$J\java.exe" -cp build\test SelfTest
 ```
