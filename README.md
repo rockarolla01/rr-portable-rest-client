@@ -79,7 +79,19 @@ Below is a detailed, AI-generated overview.
 ```powershell
 $J = "C:\Soft\jdk-25.0.5.0.2+1\bin"
 & "$J\java.exe" PortableRestClient.java              # run from source, no build step
-& "$J\java.exe" PortableRestClient.java --selftest   # built-in tests
+```
+
+Tests (`test\SelfTest.java`) compile together with the app; the exit code is non-zero on failure:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File test\run.ps1   # optional: -Jdk <jdk folder>
+```
+
+or by hand:
+
+```powershell
+& "$J\javac.exe" -d build\test PortableRestClient.java test\SelfTest.java
+& "$J\java.exe" -cp build\test SelfTest
 ```
 
 ## Data location
