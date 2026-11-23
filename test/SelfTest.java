@@ -45,6 +45,7 @@ final class SelfTest extends PortableRestClient {
         t.section("download", t::download);
         t.section("postman", t::postman);
         t.section("storage", t::storage);
+        t.section("multipart", t::multipart);
         t.section("http", t::http);
         t.section("https", t::https);
         System.out.println((t.failed == 0 ? "OK" : "FAILED") + ": " + t.passed + " passed, " + t.failed + " failed");
@@ -286,7 +287,7 @@ final class SelfTest extends PortableRestClient {
                      "url": "{{baseUrl}}/users"}}
                 ]},
                 {"name": "Upload", "request": {"method": "POST", "auth": {"type": "noauth"},
-                  "body": {"mode": "formdata", "formdata": []}, "url": "{{baseUrl}}/upload"}},
+                  "body": {"mode": "graphql", "graphql": {}}, "url": "{{baseUrl}}/upload"}},
                 {"name": "Plain", "request": "https://example.com/plain?x=1"},
                 {"name": "Digest", "request": {"method": "GET", "auth": {"type": "digest", "digest": []}, "url": "https://example.com"}},
                 {"name": "Key", "request": {"method": "GET", "url": "https://example.com",
@@ -328,7 +329,7 @@ final class SelfTest extends PortableRestClient {
         eq("pm urlencoded mode", BodyMode.FORM, login.bodyMode);
         eq("pm urlencoded fields", "user={{user}}|debug=1(off)", kvs(login.form));
         eq("pm skipped report", List.of("Scripts on collections or folders",
-                        "Test script code other than pm.environment.set(...) (not run)", "Body mode 'formdata'", "Auth type 'digest'"),
+                        "Test script code other than pm.environment.set(...) (not run)", "Body mode 'graphql'", "Auth type 'digest'"),
                 List.copyOf(ir.skipped.keySet()));
 
         fails("pm v1 rejected", () -> PostmanImporter.importText("{\"id\":\"x\",\"name\":\"old\",\"order\":[],\"requests\":[]}"));
@@ -485,6 +486,160 @@ final class SelfTest extends PortableRestClient {
             Files.deleteIfExists(store);
             Files.deleteIfExists(dir);
         }
+    }
+
+    static String prepared(List<String[]> headers, String name) {
+        for (String[] h : headers) if (h[0].equalsIgnoreCase(name)) return h[1];
+        return null;
+    }
+
+    void multipart() throws Exception {
+        Path dir = Files.createTempDirectory("portablerestclient-multipart");
+        Path file = dir.resolve("photo 1.png");
+        Files.write(file, new byte[] {(byte) 0x89, 'P', 'N', 'G', 0, (byte) 0xff});
+        var server = com.sun.net.httpserver.HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0);
+        server.createContext("/raw", ex -> {
+            byte[] in = ex.getRequestBody().readAllBytes();
+            ex.getResponseHeaders().add("X-Content-Type", ex.getRequestHeaders().getFirst("Content-Type"));
+            ex.getResponseHeaders().add("Content-Type", "application/octet-stream");
+            ex.sendResponseHeaders(200, in.length == 0 ? -1 : in.length);
+            ex.getResponseBody().write(in);
+            ex.close();
+        });
+        server.start();
+        try {
+            Request r = new Request("upload");
+            r.method = "POST";
+            r.setUrl("http://127.0.0.1:" + server.getAddress().getPort() + "/raw");
+            r.bodyMode = BodyMode.MULTIPART;
+            r.body = "ignored text";
+            Part meta = new Part("meta", "{\"id\": {{id}}}", false, true);
+            meta.headers.add(new KeyValue("Content-Type", "application/json", true));
+            meta.headers.add(new KeyValue("X-Off", "1", false));
+            r.parts.add(meta);
+            r.parts.add(new Part("off", "x", false, false));
+            Part photo = new Part("{{field}}", "{{dir}}/" + file.getFileName(), true, true);
+            photo.headers.add(new KeyValue("X-Note", "a\r\nb", true));
+            r.parts.add(photo);
+            Map<String, String> vars = Map.of("id", "7", "field", "pic", "dir", dir.toString());
+
+            Engine.Prepared p = Engine.prepare(r, vars);
+            eq("multipart content type", "multipart/form-data; boundary=" + p.boundary, prepared(p.headers, "Content-Type"));
+            eq("multipart enabled parts only", 2, p.parts.size());
+            eq("multipart text part", "{\"id\": 7}", p.parts.get(0).text());
+            eq("multipart file path resolved", file, p.parts.get(1).file());
+            String boundary = p.boundary;
+            Response res = Engine.send(p, new Settings()).get(15, TimeUnit.SECONDS);
+            eq("multipart status", 200, res.status);
+            eq("multipart received content type", "multipart/form-data; boundary=" + boundary, res.header("x-content-type"));
+            ByteArrayOutputStream expected = new ByteArrayOutputStream();
+            expected.writeBytes(("--" + boundary + "\r\n"
+                    + "Content-Disposition: form-data; name=\"meta\"\r\n"
+                    + "Content-Type: application/json\r\n\r\n"
+                    + "{\"id\": 7}\r\n"
+                    + "--" + boundary + "\r\n"
+                    + "Content-Disposition: form-data; name=\"pic\"; filename=\"photo 1.png\"\r\n"
+                    + "X-Note: a  b\r\n"
+                    + "Content-Type: image/png\r\n\r\n").getBytes(StandardCharsets.UTF_8));
+            expected.writeBytes(Files.readAllBytes(file));
+            expected.writeBytes(("\r\n--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8));
+            check("multipart body on the wire", Arrays.equals(expected.toByteArray(), res.bytes));
+            check("multipart parts in the log", res.requestSummary.contains("[part 'pic': file " + file + "]"));
+
+            // A user Content-Type: its boundary is used; without one, ours is appended.
+            r.headers.add(new KeyValue("Content-Type", "multipart/form-data; boundary=\"abc\"", true));
+            eq("multipart user boundary kept", "abc", Engine.prepare(r, vars).boundary);
+            r.headers.get(0).value = "multipart/mixed";
+            Engine.Prepared mixed = Engine.prepare(r, vars);
+            eq("multipart boundary appended", "multipart/mixed; boundary=" + mixed.boundary, prepared(mixed.headers, "Content-Type"));
+            Settings cs = new Settings();
+            cs.curlMultiline = false;
+            eq("curl multipart", "curl -L --max-time 30 -X POST " + r.url() + " -H 'Content-Type: multipart/mixed'"
+                    + " -F 'meta=\"{\\\"id\\\": 7}\";headers=\"Content-Type: application/json\"'"
+                    + " -F 'pic=@\"" + file.toString().replace("\\", "\\\\").replace("\"", "\\\"").replace("'", "'\\''")
+                    + "\";headers=\"X-Note: a  b\";headers=\"Content-Type: image/png\"'",
+                    Engine.curl(mixed, cs));
+            r.headers.clear();
+            check("curl multipart leaves out the default content type",
+                    !Engine.curl(Engine.prepare(r, vars), cs).contains("Content-Type: multipart"));
+
+            photo.value = "{{dir}}/missing.bin";
+            try {
+                Engine.send(Engine.prepare(r, vars), new Settings()).get(15, TimeUnit.SECONDS);
+                check("multipart missing file fails", false);
+            } catch (ExecutionException e) {
+                check("multipart missing file described", Engine.describe(e).contains("not found") && Engine.describe(e).contains("missing.bin"));
+            }
+            photo.value = " ";
+            fails("multipart file part without a path", () -> Engine.prepare(r, vars));
+            photo.value = "relative/x.bin";
+            eq("multipart relative path from app folder", Storage.appDir().resolve("relative/x.bin").normalize(),
+                    Engine.prepare(r, vars).parts.get(1).file());
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(file);
+            Files.deleteIfExists(dir);
+        }
+
+        eq("disposition quoting", "a%22b%0D%0Ac", Engine.dispositionQuote("a\"b\r\nc"));
+        eq("content type from extension", "image/png", Engine.contentTypeFor("a.PNG"));
+        eq("content type from the app's table", "application/json", Engine.contentTypeFor("data.json"));
+        eq("content type fallback", "application/octet-stream", Engine.contentTypeFor("blob.unknownext"));
+
+        // Storage keeps the part type and headers, and a copy keeps parts as parts.
+        Request q = new Request("q");
+        q.bodyMode = BodyMode.MULTIPART;
+        Part qp = new Part("f", "C:\\data\\a.txt", true, false);
+        qp.headers.add(new KeyValue("Content-Type", "text/csv", true));
+        q.parts.add(qp);
+        q.parts.add(new Part("t", "v", false, true));
+        Request back = Storage.copy(q);
+        eq("storage multipart mode", BodyMode.MULTIPART, back.bodyMode);
+        check("storage parts are parts", back.parts.get(0) instanceof Part bp && bp.file && !bp.enabled
+                && bp.headers.size() == 1 && bp.headers.get(0).value.equals("text/csv")
+                && back.parts.get(1) instanceof Part tp && !tp.file);
+        check("storage multipart same content", Storage.sameContent(q, back));
+        ((Part) back.parts.get(0)).headers.get(0).value = "text/plain";
+        check("part header edit is a change", !Storage.sameContent(q, back));
+        Request target = new Request("target");
+        target.copyFrom(back);
+        check("copyFrom copies parts deeply", target.parts.get(0) instanceof Part cp && cp.headers.get(0) != ((Part) back.parts.get(0)).headers.get(0)
+                && Storage.kvs(back.parts).equals(Storage.kvs(target.parts)));
+
+        // Table model: the blank row, type switching and undo of a header edit.
+        PartModel m = new PartModel(() -> { });
+        m.rows = new ArrayList<>();
+        int[] picked = {-1};
+        m.onBecameFile = row -> picked[0] = row;
+        m.setValueAt("Text", 0, PartModel.TYPE);
+        eq("choosing Text on the blank row adds nothing", 0, m.rows.size());
+        m.setValueAt("doc", 0, 1);
+        check("new row is a text part", m.rows.get(0) instanceof Part np && !np.file);
+        m.setValueAt("File", 0, PartModel.TYPE);
+        eq("switching to File asks for a file", 0, picked[0]);
+        m.chooseFile(0, "x.pdf");
+        eq("chosen file", "doc=x.pdf", kvs(m.rows));
+        m.setHeaders(0, List.of(new KeyValue("X-A", "1", true)));
+        eq("headers count cell", "1", m.getValueAt(0, PartModel.HEADERS));
+        KvHistory.Snapshot undone = m.history.undo(m.rows);
+        check("header edit undoes to the old part", undone.rows().get(0) instanceof Part up && up.headers.isEmpty() && up.file);
+
+        // Postman form-data.
+        Collection pc = PostmanImporter.importText("""
+            {"info": {"name": "fd", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+             "item": [{"name": "Up", "request": {"method": "POST", "url": "https://h.example/up",
+               "body": {"mode": "formdata", "formdata": [
+                 {"key": "meta", "value": "{{m}}", "type": "text", "contentType": "application/json"},
+                 {"key": "doc", "type": "file", "src": "/C:/files/a.pdf"},
+                 {"key": "many", "type": "file", "src": ["/tmp/1.txt", "/tmp/2.txt"], "disabled": true},
+                 {"key": "none", "type": "file", "src": []},
+                 {"key": "", "value": "dropped"}]}}}]}
+            """).collection;
+        Request up = (Request) pc.items.get(0);
+        eq("pm formdata mode", BodyMode.MULTIPART, up.bodyMode);
+        eq("pm formdata parts", "meta={{m}}|doc=C:/files/a.pdf|many=/tmp/1.txt(off)|none=", kvs(up.parts));
+        check("pm formdata types", !((Part) up.parts.get(0)).file && ((Part) up.parts.get(1)).file);
+        eq("pm formdata content type", "Content-Type=application/json", kvs(((Part) up.parts.get(0)).headers));
     }
 
     void http() throws Exception {

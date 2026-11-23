@@ -20,8 +20,8 @@ Status: implemented (v1.0). `README.md` has the user-facing feature list.
 ## Layout
 
 ```
-PortableRestClient.java   whole application (~4,050 lines)
-test/SelfTest.java        self-tests (~630 lines)
+PortableRestClient.java   whole application (~4,450 lines)
+test/SelfTest.java        self-tests (~790 lines)
 test/run.ps1              compiles app + tests into build\test and runs them
 README.md
 ```
@@ -39,6 +39,9 @@ Sections inside `PortableRestClient.java`, in this order:
    - `OpenTab(requestId, preview, draft)` and `Workspace.openTabs` / `selectedTab`: the tab session. `draft` is null when the tab had no unsaved changes.
    - Post-actions are a `List<KeyValue>`: key = variable name, value = JSON path (empty = whole body).
    - `BodyMode.FORM` uses `Request.form` (a `List<KeyValue>`). It's kept separate from `body`, so switching modes loses nothing.
+   - `BodyMode.MULTIPART` uses `Request.parts`, a `List<KeyValue>` whose elements are all `Part` (`extends KeyValue`, adding a `file` flag and its own `headers` list).
+     - Extending `KeyValue` lets `KvTable`, `KvHistory` and `copyFrom` handle parts unchanged. `Part.copy()` is deep.
+     - Storage writes `type` (`text`/`file`) and `headers` on each part.
 4. `Urls`: query parse/join and `encode`, which percent-encodes only illegal characters and keeps existing `%XX` escapes.
 5. `Storage`: the workspace JSON format.
    - The default file is `<appDir>\data\workspace.json`; override it with `-Dportablerestclient.workspace=…`.
@@ -57,6 +60,8 @@ Sections inside `PortableRestClient.java`, in this order:
 7. `Response`, `Engine`: variable resolution, `prepare` (builds the URI and headers), async `send` (cancellable), response decoding, `applyPostActions`.
 8. UI:
    - `KvTable`/`KvModel`: reusable key/value table whose last row is a blank row for adding entries.
+     - Column 0 is the checkbox and column 1 the key. Subclasses override `cell`, `set`, `newRow` and `valueColumn`.
+     - `PartModel` adds the Type column and the "…" headers column.
    - `Ui`: the frame, tree, dialogs, import, and send flow.
    - `Ui.RequestTab`: one open request, with its own `RequestEditor`, plus `Ui.StripMouse` (clicks, drag reorder).
    - `Ui.RequestEditor` (one per tab) and `Ui.ResponseView` (shared; shows the selected tab's last response).
@@ -135,6 +140,27 @@ powershell -ExecutionPolicy Bypass -File test\run.ps1   # same as the two lines 
   - Form body → `application/x-www-form-urlencoded`.
   - `User-Agent: PortableRestClient/1.0` and `Accept: */*`.
 - **Form body (`x-www-form-urlencoded`):** `Engine.formBody` substitutes variables in each enabled field first, then encodes the key and value with `URLEncoder` (UTF-8, space → `+`). That way a resolved `&` or `=` can't split a field.
+- **Multipart body:**
+  - Columns: enabled, Name, Type (Text/File drop-down), Value / file, and "…".
+    - File rows paint a **Browse…** button inside the value cell. A click on its area opens the chooser.
+    - "…" opens a modal dialog with a `KvTable` of part headers. The button shows how many are active.
+    - Switching a part to File with no path opens the chooser (`PartModel.onBecameFile`).
+    - A picked file (`chooseFile`) and OK in the headers dialog (`setHeaders`) are one undo step each.
+  - `Engine.prepare` resolves variables in names, values, file paths and part headers.
+    - It builds `Prepared.parts` (`PreparedPart`) plus `Prepared.boundary`; `Prepared.body` stays null.
+    - Line breaks in part header values become spaces.
+  - Default part headers, added only when the part doesn't set them:
+    - `Content-Disposition: form-data; name=…; filename=…`, with `"`, CR and LF percent-escaped as browsers do.
+    - For files, `Content-Type` from `contentTypeFor`: the JDK's guess, then `TYPE_EXTENSIONS` reversed, then `application/octet-stream`.
+  - Request `Content-Type`:
+    - The default `multipart/form-data; boundary=…` is implicit, because curl `-F` writes its own.
+    - When the user sets a value with `boundary=`, that boundary is used. A value without one gets ours appended.
+  - Relative file paths resolve against `Storage.appDir()`. The chooser stores files inside the app folder as relative paths. An empty path fails `prepare`.
+  - `send` streams files with `BodyPublishers.concat` + `ofFile`. A missing file fails the future with `FileNotFoundException`.
+  - curl:
+    - One `-F 'name="text"'` or `-F 'name=@"path"'` per part.
+    - Every part header except Content-Disposition goes in `;headers="K: V"`. A `Content-Type` there replaces curl's own; `;type=` would send quotes literally.
+    - A user-set Content-Type loses its boundary parameter.
 - **Response display:**
   - Pretty-print when the content type is JSON or the body starts with `{`/`[` and parses. This is computed off the UI thread in `Response.analyze()`.
   - The charset comes from `Content-Type`; gzip/deflate bodies are decoded.
@@ -185,6 +211,11 @@ powershell -ExecutionPolicy Bypass -File test\run.ps1   # same as the two lines 
   - `header[]` with `disabled`, or v2.0 `"K: V"` header strings.
   - `body.mode=raw`: JSON when `options.raw.language=json`, or when there is no language and the text starts with `{`/`[`; plain text otherwise.
   - `body.mode=urlencoded` → form body, from `urlencoded[]` with `disabled`. Entries without a key are dropped.
+  - `body.mode=formdata` → multipart body, from `formdata[]`:
+    - `type` is text or file, plus `disabled`.
+    - `src` keeps only the first file; extra files are reported. A leading `/` before a drive letter is dropped.
+    - `contentType` becomes a part `Content-Type` header.
+    - File parts without `src` are reported.
   - Collection `variable[]`.
   - Environment exports `{name, values:[{key,value,enabled}]}`. Imported environment names are made unique.
 - **Auth:**
@@ -201,7 +232,7 @@ powershell -ExecutionPolicy Bypass -File test\run.ps1   # same as the two lines 
     - an alias created by `var x = pm.response.json()`
   - Anything else is reported.
 - **Ignored and reported:**
-  - Other body modes (formdata, file, graphql) and other auth types.
+  - Other body modes (file, graphql) and other auth types.
   - Pre-request scripts, scripts on collections or folders, other test code, and path variables.
   - Never fail an import over an unsupported feature.
   - Postman v1 collections are rejected with a clear message.

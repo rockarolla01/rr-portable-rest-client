@@ -21,6 +21,7 @@ import java.time.*;
 import java.util.*;
 import java.util.List;
 import java.util.concurrent.*;
+import java.util.function.IntConsumer;
 import java.util.function.Supplier;
 import java.util.regex.*;
 import java.util.stream.Collectors;
@@ -352,7 +353,7 @@ public class PortableRestClient {
     // Model
     // =====================================================================================
 
-    static final class KeyValue {
+    static class KeyValue {
         String key = "";
         String value = "";
         boolean enabled = true;
@@ -370,7 +371,30 @@ public class PortableRestClient {
         boolean active() { return enabled && !key.isBlank(); }
     }
 
-    enum BodyMode { NONE, TEXT, JSON, FORM }
+    /**
+     * One multipart/form-data part: key = field name, value = the text, or the file path for a file part.
+     * It extends KeyValue so the key/value table, its undo history and copyFrom work on parts unchanged.
+     */
+    static final class Part extends KeyValue {
+        boolean file;
+        /** Extra part headers; Content-Disposition (and a file's Content-Type) are generated unless set here. */
+        final List<KeyValue> headers = new ArrayList<>();
+
+        Part() { }
+
+        Part(String key, String value, boolean file, boolean enabled) {
+            super(key, value, enabled);
+            this.file = file;
+        }
+
+        @Override Part copy() {
+            Part p = new Part(key, value, file, enabled);
+            for (KeyValue h : headers) p.headers.add(h.copy());
+            return p;
+        }
+    }
+
+    enum BodyMode { NONE, TEXT, JSON, FORM, MULTIPART }
 
     abstract static class Item {
         String name;
@@ -404,6 +428,8 @@ public class PortableRestClient {
         String body = "";
         /** Fields of an x-www-form-urlencoded body; kept apart from {@link #body} so switching modes loses nothing. */
         final List<KeyValue> form = new ArrayList<>();
+        /** Parts of a multipart/form-data body; every element is a {@link Part}. */
+        final List<KeyValue> parts = new ArrayList<>();
         /** key = variable name, value = JSON path (empty = whole body). */
         final List<KeyValue> postActions = new ArrayList<>();
 
@@ -431,6 +457,7 @@ public class PortableRestClient {
             copyRows(o.params, params);
             copyRows(o.headers, headers);
             copyRows(o.form, form);
+            copyRows(o.parts, parts);
             copyRows(o.postActions, postActions);
         }
 
@@ -703,6 +730,7 @@ public class PortableRestClient {
                 m.put("bodyMode", r.bodyMode.name().toLowerCase(Locale.ROOT));
                 m.put("body", r.body);
                 m.put("form", kvs(r.form));
+                m.put("parts", kvs(r.parts));
                 m.put("postActions", kvs(r.postActions));
             } else if (it instanceof Folder f) {
                 m.put("type", f instanceof Collection ? "collection" : "folder");
@@ -727,6 +755,7 @@ public class PortableRestClient {
                 catch (IllegalArgumentException e) { r.bodyMode = BodyMode.NONE; }
                 r.body = Json.str(m.get("body"));
                 readKvs(m.get("form"), r.form);
+                readParts(m.get("parts"), r.parts);
                 readKvs(m.get("postActions"), r.postActions);
                 return r;
             }
@@ -756,6 +785,10 @@ public class PortableRestClient {
                 m.put("key", kv.key);
                 m.put("value", kv.value);
                 m.put("enabled", kv.enabled);
+                if (kv instanceof Part p) {
+                    m.put("type", p.file ? "file" : "text");
+                    m.put("headers", kvs(p.headers));
+                }
                 out.add(m);
             }
             return out;
@@ -765,6 +798,16 @@ public class PortableRestClient {
             for (Object o : Json.arr(json)) {
                 Map<String, Object> m = Json.obj(o);
                 into.add(new KeyValue(Json.str(m.get("key")), Json.str(m.get("value")), Json.bool(m.get("enabled"), true)));
+            }
+        }
+
+        static void readParts(Object json, List<KeyValue> into) {
+            for (Object o : Json.arr(json)) {
+                Map<String, Object> m = Json.obj(o);
+                Part p = new Part(Json.str(m.get("key")), Json.str(m.get("value")),
+                        Json.str(m.get("type")).equals("file"), Json.bool(m.get("enabled"), true));
+                readKvs(m.get("headers"), p.headers);
+                into.add(p);
             }
         }
 
@@ -943,9 +986,32 @@ public class PortableRestClient {
                     q.form.add(new KeyValue(Json.str(m.get("key")), Json.str(m.get("value")), !Json.bool(m.get("disabled"), false)));
                 }
                 q.bodyMode = BodyMode.FORM;
+            } else if (mode.equals("formdata")) {
+                for (Object o : Json.arr(b.get("formdata"))) formPart(q, Json.obj(o), r);
+                q.bodyMode = BodyMode.MULTIPART;
             } else if (!mode.isEmpty()) {
                 r.skip("Body mode '" + mode + "'");
             }
+        }
+
+        private static void formPart(Request q, Map<String, Object> m, ImportResult r) {
+            String key = Json.str(m.get("key"));
+            if (key.isEmpty()) return;
+            boolean file = Json.str(m.get("type")).equals("file");
+            String value = Json.str(m.get("value"));
+            if (file) {
+                Object src = m.get("src");
+                List<Object> files = src instanceof List<?> ? Json.arr(src) : src == null ? List.of() : List.of(src);
+                if (files.size() > 1) r.skip("Form-data files after the first in a part");
+                value = files.isEmpty() ? "" : Json.str(files.get(0));
+                // Postman on Windows writes "/C:/dir/file"; the leading slash makes it an invalid Windows path.
+                if (value.matches("/[A-Za-z]:[/\\\\].*")) value = value.substring(1);
+                if (value.isEmpty()) r.skip("Form-data file parts without a file (pick one after import)");
+            }
+            Part p = new Part(key, value, file, !Json.bool(m.get("disabled"), false));
+            String type = Json.str(m.get("contentType"));
+            if (!type.isEmpty()) p.headers.add(new KeyValue("Content-Type", type, true));
+            q.parts.add(p);
         }
 
         private static Map<String, Object> effectiveAuth(Object own, Map<String, Object> inherited) {
@@ -1126,11 +1192,17 @@ public class PortableRestClient {
         private static HttpClient client;
         private static String clientKey;
 
+        /** A multipart part ready to send: text is null for a file part; headers start with Content-Disposition. */
+        record PreparedPart(String name, String text, Path file, List<String[]> headers) { }
+
         static final class Prepared {
             String method;
             URI uri;
             final List<String[]> headers = new ArrayList<>();
             String body;
+            /** Set only for a multipart body, which is sent from {@link #parts} (files are streamed, not loaded). */
+            String boundary;
+            final List<PreparedPart> parts = new ArrayList<>();
             final List<String> messages = new ArrayList<>();
             /** Defaults curl already sends on its own (User-Agent, Accept), so the curl tab leaves them out. */
             final List<String[]> implicit = new ArrayList<>();
@@ -1144,8 +1216,13 @@ public class PortableRestClient {
                 StringBuilder b = new StringBuilder(method).append(' ').append(uri);
                 for (String[] h : headers) b.append("\n  ").append(h[0]).append(": ").append(h[1]);
                 if (body != null) b.append("\n  [body: ").append(body.length()).append(" characters]");
+                for (PreparedPart part : parts)
+                    b.append("\n  [part '").append(part.name()).append("': ").append(part.file() != null
+                            ? "file " + part.file() : part.text().length() + " characters").append(']');
                 return b.toString();
             }
+
+            boolean hasBody() { return body != null || boundary != null; }
         }
 
         /** Collection variables first, then the environment, so environment values win. */
@@ -1209,6 +1286,8 @@ public class PortableRestClient {
                 p.body = formBody(r.form, vars, unresolved);
                 if (!hasHeader(p.headers, "content-type"))
                     p.headers.add(new String[] {"Content-Type", "application/x-www-form-urlencoded"});
+            } else if (r.bodyMode == BodyMode.MULTIPART) {
+                multipart(p, r.parts, vars, unresolved);
             } else if (r.bodyMode != BodyMode.NONE) {
                 p.body = resolve(r.body, vars, unresolved);
                 if (!hasHeader(p.headers, "content-type"))
@@ -1230,6 +1309,100 @@ public class PortableRestClient {
             return j.toString();
         }
 
+        static final Pattern BOUNDARY = Pattern.compile("(?i);\\s*boundary=(\"?)([^\";]+)\\1");
+
+        /**
+         * Variables are resolved in names, values, file paths and part headers. A relative file path is
+         * taken from the app folder, so a portable install can carry its upload files along.
+         */
+        private static void multipart(Prepared p, List<KeyValue> parts, Map<String, String> vars, Set<String> unresolved) {
+            p.boundary = "----PortableRestClient" + UUID.randomUUID().toString().replace("-", "");
+            String[] type = header(p.headers, "content-type");
+            if (type == null) {
+                p.addImplicit(new String[] {"Content-Type", "multipart/form-data; boundary=" + p.boundary}); // curl -F makes its own
+            } else {
+                // A user-set boundary must be the one used; one without (common in Postman exports) needs ours.
+                Matcher m = BOUNDARY.matcher(type[1]);
+                if (m.find()) p.boundary = m.group(2);
+                else type[1] = type[1].strip() + "; boundary=" + p.boundary;
+            }
+            for (KeyValue kv : parts) {
+                if (!(kv instanceof Part part) || !part.active()) continue;
+                String name = resolve(part.key, vars, unresolved).trim();
+                String value = resolve(part.value, vars, unresolved);
+                List<String[]> headers = new ArrayList<>();
+                for (KeyValue h : part.headers)
+                    if (h.active()) headers.add(new String[] {oneLine(resolve(h.key, vars, unresolved).trim()),
+                            oneLine(resolve(h.value, vars, unresolved))});
+                Path file = part.file ? uploadPath(name, value) : null;
+                if (header(headers, "content-disposition") == null) {
+                    String d = "form-data; name=\"" + dispositionQuote(name) + "\"";
+                    if (file != null) d += "; filename=\"" + dispositionQuote(String.valueOf(file.getFileName())) + "\"";
+                    headers.addFirst(new String[] {"Content-Disposition", d});
+                }
+                if (file != null && header(headers, "content-type") == null)
+                    headers.add(new String[] {"Content-Type", contentTypeFor(String.valueOf(file.getFileName()))});
+                p.parts.add(new PreparedPart(name, file == null ? value : null, file, headers));
+            }
+        }
+
+        private static Path uploadPath(String part, String path) {
+            String v = path.strip();
+            if (v.isEmpty()) throw new IllegalArgumentException("Multipart part '" + part + "' has no file selected");
+            try { return Storage.appDir().resolve(v).normalize(); }
+            catch (InvalidPathException e) { throw new IllegalArgumentException("Multipart part '" + part + "': invalid file path " + v); }
+        }
+
+        /** As browsers do (HTML form-data encoding): quotes and line breaks are percent-escaped. */
+        static String dispositionQuote(String v) {
+            return v.replace("\"", "%22").replace("\r", "%0D").replace("\n", "%0A");
+        }
+
+        /** A line break inside a part header would end the header block early. */
+        private static String oneLine(String v) { return v.replace('\r', ' ').replace('\n', ' '); }
+
+        static String contentTypeFor(String fileName) {
+            String guess = URLConnection.guessContentTypeFromName(fileName);
+            if (guess != null) return guess;
+            int dot = fileName.lastIndexOf('.');
+            String ext = dot < 0 ? "" : fileName.substring(dot + 1).toLowerCase(Locale.ROOT);
+            // Several types can map to one extension; the alphabetically first keeps the choice stable.
+            return TYPE_EXTENSIONS.entrySet().stream().filter(e -> e.getValue().equals(ext)).map(Map.Entry::getKey)
+                    .sorted().findFirst().orElse("application/octet-stream");
+        }
+
+        /** The body publisher for a multipart request; files are read while sending. */
+        static HttpRequest.BodyPublisher multipartBody(Prepared p) throws FileNotFoundException {
+            List<HttpRequest.BodyPublisher> pieces = new ArrayList<>();
+            for (PreparedPart part : p.parts) {
+                StringBuilder head = new StringBuilder("--").append(p.boundary).append("\r\n");
+                for (String[] h : part.headers()) head.append(h[0]).append(": ").append(h[1]).append("\r\n");
+                pieces.add(HttpRequest.BodyPublishers.ofString(head.append("\r\n").toString(), StandardCharsets.UTF_8));
+                if (part.file() == null) pieces.add(HttpRequest.BodyPublishers.ofString(part.text(), StandardCharsets.UTF_8));
+                else if (!Files.isRegularFile(part.file()))
+                    throw new FileNotFoundException("File for multipart part '" + part.name() + "' not found: " + part.file());
+                else pieces.add(HttpRequest.BodyPublishers.ofFile(part.file()));
+                pieces.add(HttpRequest.BodyPublishers.ofString("\r\n", StandardCharsets.UTF_8));
+            }
+            pieces.add(HttpRequest.BodyPublishers.ofString("--" + p.boundary + "--\r\n", StandardCharsets.UTF_8));
+            return HttpRequest.BodyPublishers.concat(pieces.toArray(HttpRequest.BodyPublisher[]::new));
+        }
+
+        /**
+         * One curl -F argument. Part headers go in ;headers= (a Content-Type there replaces curl's own, and
+         * unlike ;type= it may hold a quoted "; charset=..."); curl writes its own Content-Disposition.
+         */
+        static String curlFormPart(PreparedPart part) {
+            StringBuilder b = new StringBuilder(part.name()).append('=');
+            if (part.file() != null) b.append('@').append(curlWord(part.file().toString()));
+            else b.append(curlWord(part.text())); // quoted, so a leading @ or < stays literal text
+            for (String[] h : part.headers())
+                if (!h[0].equalsIgnoreCase("content-disposition")) b.append(";headers=").append(curlWord(h[0] + ": " + h[1]));
+            return b.toString();
+        }
+
+        private static String curlWord(String v) { return "\"" + v.replace("\\", "\\\\").replace("\"", "\\\"") + "\""; }
+
         /**
          * The curl command that sends what {@link #send} would send, in POSIX shell syntax
          * (bash, Git Bash, WSL). Headers the HTTP client manages itself are left out, as in send.
@@ -1242,12 +1415,17 @@ public class PortableRestClient {
             if (s.followRedirects) parts.add("-L");
             if (s.http2) parts.add("--http2");
             parts.add("--max-time " + Math.max(1, s.timeoutSeconds));
-            if (!p.method.equals("GET") || p.body != null) parts.add("-X " + shellQuote(p.method));
+            if (!p.method.equals("GET") || p.hasBody()) parts.add("-X " + shellQuote(p.method));
             parts.add(shellQuote(p.uri.toASCIIString()));
-            for (String[] h : p.headers)
-                if (!RESTRICTED.contains(h[0].toLowerCase(Locale.ROOT)) && !p.implicit.contains(h))
-                    parts.add("-H " + shellQuote(h[0] + ": " + h[1]));
+            for (String[] h : p.headers) {
+                if (RESTRICTED.contains(h[0].toLowerCase(Locale.ROOT)) || p.implicit.contains(h)) continue;
+                String value = h[1];
+                // curl -F picks its own boundary and adds it to a user-set multipart Content-Type.
+                if (p.boundary != null && h[0].equalsIgnoreCase("content-type")) value = BOUNDARY.matcher(value).replaceAll("");
+                parts.add("-H " + shellQuote(h[0] + ": " + value));
+            }
             if (p.body != null) parts.add("--data-raw " + shellQuote(p.body));
+            for (PreparedPart part : p.parts) parts.add("-F " + shellQuote(curlFormPart(part)));
             return String.join(s.curlMultiline ? " \\\n  " : " ", parts);
         }
 
@@ -1257,9 +1435,11 @@ public class PortableRestClient {
             return "'" + v.replace("'", "'\\''") + "'";
         }
 
-        private static boolean hasHeader(List<String[]> headers, String name) {
-            for (String[] h : headers) if (h[0].equalsIgnoreCase(name)) return true;
-            return false;
+        private static boolean hasHeader(List<String[]> headers, String name) { return header(headers, name) != null; }
+
+        private static String[] header(List<String[]> headers, String name) {
+            for (String[] h : headers) if (h[0].equalsIgnoreCase(name)) return h;
+            return null;
         }
 
         /** Sends asynchronously; cancelling the returned future aborts the exchange. */
@@ -1275,10 +1455,10 @@ public class PortableRestClient {
                     try { b.header(h[0], h[1]); }
                     catch (IllegalArgumentException e) { p.messages.add("Header '" + h[0] + "' skipped: " + e.getMessage()); }
                 }
-                b.method(p.method, p.body == null ? HttpRequest.BodyPublishers.noBody()
+                b.method(p.method, p.boundary != null ? multipartBody(p) : p.body == null ? HttpRequest.BodyPublishers.noBody()
                         : HttpRequest.BodyPublishers.ofString(p.body, StandardCharsets.UTF_8));
                 req = b.build();
-            } catch (IllegalArgumentException e) {
+            } catch (IllegalArgumentException | FileNotFoundException e) {
                 return CompletableFuture.failedFuture(e);
             }
             if (s.insecureTls && "https".equalsIgnoreCase(p.uri.getScheme()))
@@ -1948,8 +2128,12 @@ public class PortableRestClient {
         Supplier<VarLookup> vars;
 
         KvTable(String keyTitle, String valueTitle, Runnable onChange) {
+            this(new KvModel(keyTitle, valueTitle, onChange));
+        }
+
+        KvTable(KvModel model) {
             super(new BorderLayout());
-            model = new KvModel(keyTitle, valueTitle, onChange);
+            this.model = model;
             table = new JTable(model) {
                 @Override public String getToolTipText(MouseEvent e) {
                     String tip = cellVarTip(e);
@@ -1994,7 +2178,7 @@ public class PortableRestClient {
                     return this;
                 }
             };
-            for (int col = 1; col <= 2; col++) {
+            for (int col : new int[] {1, model.valueColumn()}) {
                 JTextField field = new JTextField();
                 field.setBorder(BorderFactory.createLineBorder(Color.BLACK));
                 // Highlights can't change inside a document event, hence invokeLater.
@@ -2010,7 +2194,7 @@ public class PortableRestClient {
         private String cellVarTip(MouseEvent e) {
             if (vars == null) return null;
             int row = table.rowAtPoint(e.getPoint()), col = table.columnAtPoint(e.getPoint());
-            if (row < 0 || col < 1) return null;
+            if (row < 0 || (col != 1 && col != model.valueColumn())) return null;
             Object value = table.getValueAt(row, col);
             if (value == null) return null;
             List<String> names = VarLookup.refs(value.toString()).stream().map(VarLookup.Ref::name).distinct().toList();
@@ -2113,19 +2297,36 @@ public class PortableRestClient {
         }
     }
 
-    static final class KvModel extends AbstractTableModel {
+    /** Columns: enabled, key, value. {@link PartModel} adds more; column 0 is always the checkbox and 1 the key. */
+    static class KvModel extends AbstractTableModel {
         final String[] columns;
         final Runnable onChange;
         final KvHistory history = new KvHistory();
         List<KeyValue> rows;
 
         KvModel(String keyTitle, String valueTitle, Runnable onChange) {
-            this.columns = new String[] {"", keyTitle, valueTitle};
+            this(new String[] {"", keyTitle, valueTitle}, onChange);
+        }
+
+        KvModel(String[] columns, Runnable onChange) {
+            this.columns = columns;
             this.onChange = onChange;
         }
 
+        int valueColumn() { return 2; }
+
+        KeyValue newRow() { return new KeyValue(); }
+
+        Object cell(KeyValue kv, int c) { return c == 0 ? kv.enabled : c == 1 ? kv.key : kv.value; }
+
+        void set(KeyValue kv, int c, Object v) {
+            if (c == 0) kv.enabled = Boolean.TRUE.equals(v);
+            else if (c == 1) kv.key = String.valueOf(v);
+            else kv.value = String.valueOf(v);
+        }
+
         @Override public int getRowCount() { return rows == null ? 0 : rows.size() + 1; }
-        @Override public int getColumnCount() { return 3; }
+        @Override public int getColumnCount() { return columns.length; }
         @Override public String getColumnName(int c) { return columns[c]; }
         @Override public Class<?> getColumnClass(int c) { return c == 0 ? Boolean.class : String.class; }
 
@@ -2133,28 +2334,88 @@ public class PortableRestClient {
 
         @Override public Object getValueAt(int r, int c) {
             if (r >= rows.size()) return c == 0 ? Boolean.FALSE : "";
-            KeyValue kv = rows.get(r);
-            return c == 0 ? kv.enabled : c == 1 ? kv.key : kv.value;
+            return cell(rows.get(r), c);
         }
 
         @Override public void setValueAt(Object v, int r, int c) {
             if (rows == null) return;
             if (r >= rows.size()) {
-                String s = String.valueOf(v);
-                if (c == 0 || s.isEmpty()) return;
+                if (c == 0 || String.valueOf(v).isEmpty()) return;
                 history.record(KvHistory.copy(rows), r);
-                rows.add(c == 1 ? new KeyValue(s, "", true) : new KeyValue("", s, true));
+                KeyValue kv = newRow();
+                set(kv, c, v);
+                rows.add(kv);
                 fireTableRowsUpdated(r, r);
                 fireTableRowsInserted(r + 1, r + 1);
             } else {
-                KeyValue kv = rows.get(r);
                 if (Objects.equals(getValueAt(r, c), c == 0 ? (Object) Boolean.TRUE.equals(v) : String.valueOf(v))) return;
                 history.record(KvHistory.copy(rows), r);
-                if (c == 0) kv.enabled = Boolean.TRUE.equals(v);
-                else if (c == 1) kv.key = String.valueOf(v);
-                else kv.value = String.valueOf(v);
+                set(rows.get(r), c, v);
                 fireTableCellUpdated(r, c);
             }
+            onChange.run();
+        }
+    }
+
+    /** Multipart parts: enabled, name, Text/File, value or file path, and the "…" part-headers button. */
+    static final class PartModel extends KvModel {
+        static final int TYPE = 2, VALUE = 3, HEADERS = 4;
+
+        PartModel(Runnable onChange) { super(new String[] {"", "Name", "Type", "Value / file", ""}, onChange); }
+
+        @Override int valueColumn() { return VALUE; }
+
+        @Override KeyValue newRow() { return new Part(); }
+
+        @Override Object cell(KeyValue kv, int c) {
+            Part p = (Part) kv;
+            return switch (c) {
+                case TYPE -> p.file ? "File" : "Text";
+                case VALUE -> p.value;
+                case HEADERS -> Long.toString(p.headers.stream().filter(KeyValue::active).count());
+                default -> super.cell(kv, c);
+            };
+        }
+
+        @Override void set(KeyValue kv, int c, Object v) {
+            if (c == TYPE) ((Part) kv).file = "File".equals(v);
+            else super.set(kv, c, v);
+        }
+
+        /** The "…" column opens a dialog instead of an in-cell editor. */
+        @Override public boolean isCellEditable(int r, int c) { return c != HEADERS && super.isCellEditable(r, c); }
+
+        /** Called with the row when the user switches a part without a path to File, so a file can be picked. */
+        IntConsumer onBecameFile;
+
+        boolean isFile(int r) { return rows != null && r < rows.size() && ((Part) rows.get(r)).file; }
+
+        @Override public void setValueAt(Object v, int r, int c) {
+            if (rows != null && r >= rows.size() && c == TYPE && !"File".equals(v)) return; // "Text" alone is not a part yet
+            boolean wasFile = isFile(r);
+            super.setValueAt(v, r, c);
+            if (c == TYPE && !wasFile && isFile(r) && rows.get(r).value.isBlank() && onBecameFile != null) onBecameFile.accept(r);
+        }
+
+        /** A picked file, as one undoable edit; an unnamed part gets the name "file" so it is sent. */
+        void chooseFile(int r, String path) {
+            Part p = (Part) rows.get(r);
+            history.record(KvHistory.copy(rows), r);
+            p.file = true;
+            p.value = path;
+            if (p.key.isBlank()) p.key = "file";
+            fireTableRowsUpdated(r, r);
+            onChange.run();
+        }
+
+        /** Replaces a part's headers as one undoable edit. */
+        void setHeaders(int r, List<KeyValue> headers) {
+            Part p = (Part) rows.get(r);
+            if (Storage.kvs(p.headers).equals(Storage.kvs(headers))) return;
+            history.record(KvHistory.copy(rows), r);
+            p.headers.clear();
+            p.headers.addAll(headers);
+            fireTableRowsUpdated(r, r);
             onChange.run();
         }
     }
@@ -2203,6 +2464,8 @@ public class PortableRestClient {
         boolean updatingEnvCombo;
         String lastSaveError;
         File lastDir;
+        /** Where the multipart file chooser opens; remembered for the session only. */
+        File uploadDir;
 
         Ui(Path file) {
             this.file = file;
@@ -3591,6 +3854,9 @@ public class PortableRestClient {
             final JRadioButton bodyJson = new JRadioButton("JSON");
             final JRadioButton bodyForm = new JRadioButton("Form (x-www-form-urlencoded)");
             final KvTable form = new KvTable("Key", "Value", this::tableChanged);
+            final JRadioButton bodyMultipart = new JRadioButton("Multipart (form-data)");
+            final PartModel partModel = new PartModel(this::tableChanged);
+            final KvTable parts = new KvTable(partModel);
             final JPanel bodyCards = new JPanel(new CardLayout());
             final JButton format = new JButton("Format JSON");
             final JTextArea body = new JTextArea() {
@@ -3618,7 +3884,8 @@ public class PortableRestClient {
                 url.setFont(MONO);
                 ToolTipManager.sharedInstance().registerComponent(url);
                 ToolTipManager.sharedInstance().registerComponent(body);
-                for (KvTable t : List.of(params, headers, form)) t.highlightVariables(this::vars);
+                for (KvTable t : List.of(params, headers, form, parts)) t.highlightVariables(this::vars);
+                setupParts();
                 onTextChange(url, this::urlChanged);
                 url.getDocument().addUndoableEditListener(e -> {
                     if (loading) return;
@@ -3665,7 +3932,7 @@ public class PortableRestClient {
                 top.add(line, BorderLayout.CENTER);
 
                 ButtonGroup group = new ButtonGroup();
-                for (JRadioButton b : List.of(bodyNone, bodyText, bodyJson, bodyForm)) {
+                for (JRadioButton b : List.of(bodyNone, bodyText, bodyJson, bodyForm, bodyMultipart)) {
                     group.add(b);
                     b.addActionListener(e -> bodyModeChanged());
                 }
@@ -3685,9 +3952,11 @@ public class PortableRestClient {
                 bodyBar.add(bodyText);
                 bodyBar.add(bodyJson);
                 bodyBar.add(bodyForm);
+                bodyBar.add(bodyMultipart);
                 bodyBar.add(format);
                 bodyCards.add(FindBar.wrap(body, LineNumbers.scroll(body)), "text");
                 bodyCards.add(form, "form");
+                bodyCards.add(parts, "parts");
                 JPanel bodyPanel = new JPanel(new BorderLayout());
                 bodyPanel.add(bodyBar, BorderLayout.NORTH);
                 bodyPanel.add(bodyCards, BorderLayout.CENTER);
@@ -3716,6 +3985,115 @@ public class PortableRestClient {
 
             VarLookup vars() { return lookup(tab.node); }
 
+            /** Type is a Text/File drop-down; file rows get a Browse… button; "…" opens the part's headers. */
+            void setupParts() {
+                JTable t = parts.table;
+                TableColumnModel cols = t.getColumnModel();
+                TableColumn type = cols.getColumn(PartModel.TYPE);
+                type.setCellEditor(new DefaultCellEditor(new JComboBox<>(new String[] {"Text", "File"})));
+                type.setMinWidth(60);
+                type.setMaxWidth(80);
+                cols.getColumn(1).setPreferredWidth(150);
+                cols.getColumn(PartModel.VALUE).setPreferredWidth(450);
+                TableColumn more = cols.getColumn(PartModel.HEADERS);
+                more.setMinWidth(46);
+                more.setMaxWidth(46);
+                partModel.onBecameFile = row -> SwingUtilities.invokeLater(() -> browsePart(row));
+
+                JButton browse = new JButton("Browse…");
+                browse.setMargin(new Insets(0, 4, 0, 4));
+                browse.setToolTipText("Choose the file to upload");
+                JPanel fileCell = new JPanel(new BorderLayout());
+                TableCellRenderer base = cols.getColumn(PartModel.VALUE).getCellRenderer();
+                cols.getColumn(PartModel.VALUE).setCellRenderer((tbl, v, sel, focus, row, col) -> {
+                    Component c = base.getTableCellRendererComponent(tbl, v, sel, focus, row, col);
+                    if (!partModel.isFile(row)) return c;
+                    if (String.valueOf(v).isBlank() && c instanceof JLabel l) l.setText("<html><font color=gray>no file chosen</font></html>");
+                    fileCell.removeAll();
+                    fileCell.add(c, BorderLayout.CENTER);
+                    fileCell.add(browse, BorderLayout.EAST);
+                    fileCell.setBackground(c.getBackground());
+                    return fileCell;
+                });
+
+                JButton dots = new JButton();
+                dots.setMargin(new Insets(0, 2, 0, 2));
+                DefaultTableCellRenderer blank = new DefaultTableCellRenderer();
+                more.setCellRenderer((tbl, v, sel, focus, row, col) -> {
+                    if (partModel.rows == null || row >= partModel.rows.size())
+                        return blank.getTableCellRendererComponent(tbl, "", sel, false, row, col);
+                    Part part = (Part) partModel.rows.get(row);
+                    String n = String.valueOf(v);
+                    dots.setText(n.equals("0") ? "…" : "… " + n);
+                    dots.setToolTipText(partHeadersTip(part));
+                    return dots;
+                });
+
+                t.addMouseListener(new MouseAdapter() {
+                    @Override public void mouseClicked(MouseEvent e) {
+                        if (!SwingUtilities.isLeftMouseButton(e) || e.getClickCount() != 1) return;
+                        int row = t.rowAtPoint(e.getPoint()), col = t.columnAtPoint(e.getPoint());
+                        if (row < 0 || col < 0 || partModel.rows == null || row >= partModel.rows.size()) return;
+                        int c = t.convertColumnIndexToModel(col);
+                        Rectangle cell = t.getCellRect(row, col, false);
+                        if (c == PartModel.HEADERS) editPartHeaders(row);
+                        else if (c == PartModel.VALUE && partModel.isFile(row)
+                                && e.getX() >= cell.x + cell.width - browse.getPreferredSize().width) browsePart(row);
+                    }
+                });
+            }
+
+            String partHeadersTip(Part part) {
+                List<KeyValue> active = part.headers.stream().filter(KeyValue::active).toList();
+                if (active.isEmpty()) return "Part headers (none set)";
+                StringBuilder b = new StringBuilder("<html>Part headers:");
+                for (KeyValue h : active) b.append("<br>").append(html(h.key)).append(": ").append(html(h.value));
+                return b.append("</html>").toString();
+            }
+
+            void editPartHeaders(int row) {
+                parts.stopEditing();
+                Part part = (Part) req.parts.get(row);
+                List<KeyValue> rows = KvHistory.copy(part.headers);
+                KvTable table = new KvTable("Header", "Value", () -> { });
+                table.highlightVariables(this::vars);
+                table.setRows(rows);
+                JLabel hint = new JLabel("<html>Sent with this part only. Content-Disposition (and, for a file, Content-Type) "
+                        + "are generated unless you set them here.</html>");
+                JPanel content = new JPanel(new BorderLayout(0, 6));
+                content.add(hint, BorderLayout.NORTH);
+                content.add(table, BorderLayout.CENTER);
+                content.setPreferredSize(new Dimension(560, 260));
+                JOptionPane pane = new JOptionPane(content, JOptionPane.PLAIN_MESSAGE, JOptionPane.OK_CANCEL_OPTION);
+                JDialog dialog = pane.createDialog(frame, "Headers of part '" + (part.key.isBlank() ? "(unnamed)" : part.key) + "'");
+                dialog.setResizable(true);
+                dialog.setVisible(true);
+                dialog.dispose();
+                table.stopEditing();
+                if (Integer.valueOf(JOptionPane.OK_OPTION).equals(pane.getValue())) partModel.setHeaders(row, rows);
+            }
+
+            void browsePart(int row) {
+                parts.stopEditing();
+                if (row >= req.parts.size()) return;
+                Part part = (Part) req.parts.get(row);
+                Path app = Storage.appDir();
+                File current = null;
+                try {
+                    if (!part.value.isBlank() && !part.value.contains("{{")) current = app.resolve(part.value.strip()).toFile();
+                } catch (InvalidPathException ignored) { }
+                File dir = current != null && current.getParentFile() != null && current.getParentFile().isDirectory()
+                        ? current.getParentFile() : uploadDir;
+                JFileChooser fc = new JFileChooser(dir);
+                if (current != null && current.isFile()) fc.setSelectedFile(current);
+                fc.setDialogTitle("File for part '" + (part.key.isBlank() ? "file" : part.key) + "'");
+                if (fc.showOpenDialog(frame) != JFileChooser.APPROVE_OPTION) return;
+                Path chosen = fc.getSelectedFile().toPath().toAbsolutePath();
+                uploadDir = chosen.getParent() == null ? null : chosen.getParent().toFile();
+                // Files inside the app folder are stored relative to it, so they travel with a portable install.
+                partModel.chooseFile(row, chosen.startsWith(app) ? app.relativize(chosen).toString() : chosen.toString());
+            }
+
             void edited() { draftEdited(tab); }
 
             /** Fills the controls from the draft; on open and on revert. Undo history starts empty here. */
@@ -3731,6 +4109,7 @@ public class PortableRestClient {
                     headers.setRows(r.headers);
                     post.setRows(r.postActions);
                     form.setRows(r.form);
+                    parts.setRows(r.parts);
                     body.setText(r.body);
                     body.setCaretPosition(0);
                     undo.discardAllEdits();
@@ -3740,6 +4119,7 @@ public class PortableRestClient {
                         case TEXT -> bodyText;
                         case JSON -> bodyJson;
                         case FORM -> bodyForm;
+                        case MULTIPART -> bodyMultipart;
                     }).setSelected(true);
                 } finally {
                     loading = false;
@@ -3796,6 +4176,7 @@ public class PortableRestClient {
                 params.table.repaint();
                 headers.table.repaint();
                 form.table.repaint();
+                parts.table.repaint();
             }
 
             /** Rebuilt only while the tab is visible, so dynamic variables like {{$guid}} don't churn on every keystroke. */
@@ -3817,6 +4198,7 @@ public class PortableRestClient {
                 headers.stopEditing();
                 post.stopEditing();
                 form.stopEditing();
+                parts.stopEditing();
                 String typed = String.valueOf(method.getEditor().getItem()).trim().toUpperCase(Locale.ROOT);
                 if (!typed.isEmpty() && !typed.equals(req.method)) {
                     req.method = typed;
@@ -3876,8 +4258,9 @@ public class PortableRestClient {
             void bodyModeChanged() {
                 if (loading) return;
                 form.stopEditing();
+                parts.stopEditing();
                 req.bodyMode = bodyJson.isSelected() ? BodyMode.JSON : bodyText.isSelected() ? BodyMode.TEXT
-                        : bodyForm.isSelected() ? BodyMode.FORM : BodyMode.NONE;
+                        : bodyForm.isSelected() ? BodyMode.FORM : bodyMultipart.isSelected() ? BodyMode.MULTIPART : BodyMode.NONE;
                 updateBodyControls();
                 updateTabTitles();
                 edited();
@@ -3885,9 +4268,13 @@ public class PortableRestClient {
 
             void updateBodyControls() {
                 body.setEnabled(req.bodyMode != BodyMode.NONE);
-                format.setVisible(req.bodyMode != BodyMode.FORM);
+                format.setVisible(req.bodyMode != BodyMode.FORM && req.bodyMode != BodyMode.MULTIPART);
                 format.setEnabled(req.bodyMode == BodyMode.JSON);
-                ((CardLayout) bodyCards.getLayout()).show(bodyCards, req.bodyMode == BodyMode.FORM ? "form" : "text");
+                ((CardLayout) bodyCards.getLayout()).show(bodyCards, switch (req.bodyMode) {
+                    case FORM -> "form";
+                    case MULTIPART -> "parts";
+                    default -> "text";
+                });
             }
 
             void formatBody() {
@@ -3908,6 +4295,7 @@ public class PortableRestClient {
                     case TEXT -> "Body (Text)";
                     case JSON -> "Body (JSON)";
                     case FORM -> title("Body (Form)", req.form);
+                    case MULTIPART -> title("Body (Multipart)", req.parts);
                 });
                 tabs.setTitleAt(3, title("Post-processing", req.postActions));
             }
