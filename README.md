@@ -54,6 +54,11 @@ Below is a detailed, AI-generated overview.
   - Status, time, size and HTTP version.
   - JSON bodies are pretty-printed; gzip/deflate bodies are decoded.
   - Response headers, plus a log tab showing the request as it was actually sent and any warnings.
+  - **Downloads:** the **▾** next to **Send** offers **Send and Download…**, which saves the body to a file instead of showing it. **Save to File…** saves a response you already have.
+    - The save dialog opens in the folder of the last saved response, even after a restart.
+    - The suggested file name comes from the `Content-Disposition` header (`filename*` is preferred over `filename`).
+    - Without one, the name is `response`.
+    - A name without an extension gets one from the `Content-Type` (e.g. `application/pdf` → `.pdf`). For generic types such as `application/octet-stream` or `text/plain`, the extension in the URL (`…/archive.zip`) is used instead. If neither helps, it's `.txt`.
 - Post-processing: after a 2xx response, store the whole body, or a value at a JSON path such as `data.items[0].id`, in an environment variable.
 - Postman import of collections (v2.0 and v2.1) and environments. Unsupported parts are skipped and listed in a report.
   - Raw (text/JSON) and `urlencoded` bodies are imported.

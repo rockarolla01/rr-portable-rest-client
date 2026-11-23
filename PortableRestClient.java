@@ -476,6 +476,8 @@ public class PortableRestClient {
         int[] window;
         /** Horizontal scroll position of the collections tree, so long names stay scrolled as they were left. */
         int treeScrollX;
+        /** Folder of the last saved response, where the save dialog opens next time; "" = the system default. */
+        String downloadDir = "";
         /** Open request tabs in strip order, and the id of the selected one. */
         final List<OpenTab> openTabs = new ArrayList<>();
         String selectedTab = "";
@@ -639,6 +641,7 @@ public class PortableRestClient {
             m.put("settings", s);
             if (w.window != null) m.put("window", Arrays.stream(w.window).boxed().toList());
             if (w.treeScrollX > 0) m.put("treeScrollX", w.treeScrollX);
+            if (!w.downloadDir.isEmpty()) m.put("downloadDir", w.downloadDir);
             m.put("collections", w.collections.stream().map(Storage::item).toList());
             m.put("environments", w.environments.stream().map(Storage::env).toList());
             if (!w.openTabs.isEmpty()) {
@@ -671,6 +674,7 @@ public class PortableRestClient {
             List<Object> win = Json.arr(m.get("window"));
             if (win.size() >= 4) w.window = win.stream().mapToInt(o -> Json.integer(o, 0)).toArray();
             w.treeScrollX = Math.max(0, Json.integer(m.get("treeScrollX"), 0));
+            w.downloadDir = Json.str(m.get("downloadDir"));
             for (Object o : Json.arr(m.get("collections"))) {
                 Item it = item(Json.obj(o));
                 if (it instanceof Collection c) w.collections.add(c);
@@ -1072,6 +1076,10 @@ public class PortableRestClient {
         final List<String> messages = new ArrayList<>();
         /** Pretty-printed body when it is valid JSON; computed off the UI thread. */
         String pretty;
+        /** Where "Send and Download" wrote the body; the body view then shows this instead of the content. */
+        Path savedTo;
+        /** True while the save dialog is open, so a body that is about to be downloaded isn't rendered first. */
+        boolean awaitingSave;
         private boolean parsed;
         private Object json;
         private String jsonError;
@@ -1083,6 +1091,13 @@ public class PortableRestClient {
             r.messages.addAll(messages);
             return r;
         }
+
+        String header(String name) {
+            for (String[] h : headers) if (h[0].equalsIgnoreCase(name)) return h[1];
+            return null;
+        }
+
+        String fileName() { return Engine.downloadName(header("content-disposition"), contentType, url); }
 
         Object json() {
             if (!parsed) {
@@ -1319,6 +1334,129 @@ public class PortableRestClient {
                 try { return Charset.forName(m.group(1)); } catch (Exception ignored) { }
             }
             return StandardCharsets.UTF_8;
+        }
+
+        static final Pattern DISPOSITION_EXT = Pattern.compile("(?i)(?:^|;)\\s*filename\\*\\s*=\\s*([^;]*)");
+        static final Pattern DISPOSITION_NAME =
+                Pattern.compile("(?i)(?:^|;)\\s*filename\\s*=\\s*(?:\"((?:[^\"\\\\]|\\\\.)*)\"|([^;]*))");
+        static final Pattern RESERVED_FILE = Pattern.compile("(?i)(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\\..*)?");
+
+        /** Content types whose usual extension is unambiguous; parameters such as charset are stripped first. */
+        static final Map<String, String> TYPE_EXTENSIONS = Map.ofEntries(
+                Map.entry("application/json", "json"), Map.entry("text/json", "json"),
+                Map.entry("application/xml", "xml"), Map.entry("text/xml", "xml"),
+                Map.entry("text/html", "html"), Map.entry("application/xhtml+xml", "xhtml"),
+                Map.entry("text/csv", "csv"), Map.entry("text/tab-separated-values", "tsv"),
+                Map.entry("text/css", "css"), Map.entry("text/markdown", "md"), Map.entry("text/calendar", "ics"),
+                Map.entry("text/javascript", "js"), Map.entry("application/javascript", "js"),
+                Map.entry("application/yaml", "yaml"), Map.entry("application/x-yaml", "yaml"), Map.entry("text/yaml", "yaml"),
+                Map.entry("application/pdf", "pdf"), Map.entry("application/rtf", "rtf"),
+                Map.entry("application/zip", "zip"), Map.entry("application/gzip", "gz"), Map.entry("application/x-gzip", "gz"),
+                Map.entry("application/x-tar", "tar"), Map.entry("application/x-7z-compressed", "7z"),
+                Map.entry("application/vnd.rar", "rar"), Map.entry("application/x-rar-compressed", "rar"),
+                Map.entry("application/java-archive", "jar"), Map.entry("application/wasm", "wasm"),
+                Map.entry("application/msword", "doc"), Map.entry("application/vnd.ms-excel", "xls"),
+                Map.entry("application/vnd.ms-powerpoint", "ppt"),
+                Map.entry("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx"),
+                Map.entry("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx"),
+                Map.entry("application/vnd.openxmlformats-officedocument.presentationml.presentation", "pptx"),
+                Map.entry("application/vnd.oasis.opendocument.text", "odt"),
+                Map.entry("application/vnd.oasis.opendocument.spreadsheet", "ods"),
+                Map.entry("image/png", "png"), Map.entry("image/jpeg", "jpg"), Map.entry("image/gif", "gif"),
+                Map.entry("image/webp", "webp"), Map.entry("image/svg+xml", "svg"), Map.entry("image/bmp", "bmp"),
+                Map.entry("image/tiff", "tif"), Map.entry("image/avif", "avif"),
+                Map.entry("image/x-icon", "ico"), Map.entry("image/vnd.microsoft.icon", "ico"),
+                Map.entry("audio/mpeg", "mp3"), Map.entry("audio/wav", "wav"), Map.entry("audio/x-wav", "wav"),
+                Map.entry("audio/ogg", "ogg"), Map.entry("audio/aac", "aac"), Map.entry("audio/flac", "flac"),
+                Map.entry("video/mp4", "mp4"), Map.entry("video/webm", "webm"), Map.entry("video/mpeg", "mpeg"),
+                Map.entry("video/quicktime", "mov"), Map.entry("video/x-msvideo", "avi"),
+                Map.entry("font/woff", "woff"), Map.entry("font/woff2", "woff2"), Map.entry("font/ttf", "ttf"),
+                Map.entry("font/otf", "otf"));
+        /** Server-side script names say nothing about what was returned, so a URL ending in them is ignored. */
+        static final Set<String> SCRIPT_EXTENSIONS = Set.of("php", "asp", "aspx", "jsp", "jspx", "cgi", "pl", "py", "rb", "do", "action");
+        static final Pattern URL_EXTENSION = Pattern.compile("\\.([A-Za-z0-9]{1,10})$");
+
+        /**
+         * The file name to suggest when saving a response, made safe for the file system.
+         * The name comes from Content-Disposition (RFC 6266; the encoded filename* form wins over plain
+         * filename) and defaults to "response". When it has no extension, one is taken from the Content-Type,
+         * then from the URL's last path segment (for generic types like octet-stream or text/plain), then "txt".
+         */
+        static String downloadName(String contentDisposition, String contentType, String url) {
+            String name = dispositionName(contentDisposition);
+            if (name.isEmpty()) name = "response";
+            // safeFileName already removed trailing dots, so a dot past the first character starts an extension
+            if (name.lastIndexOf('.') <= 0) name += "." + extensionFor(contentType, url);
+            return name;
+        }
+
+        static String extensionFor(String contentType, String url) {
+            String type = contentType == null ? "" : contentType.split(";", 2)[0].trim().toLowerCase(Locale.ROOT);
+            String ext = TYPE_EXTENSIONS.get(type);
+            if (ext != null) return ext;
+            if (type.endsWith("+json")) return "json"; // e.g. application/problem+json, application/vnd.api+json
+            if (type.endsWith("+xml")) return "xml";
+            ext = urlExtension(url);
+            if (ext != null) return ext;
+            return "txt";
+        }
+
+        /** The extension of the URL's last path segment, or null when there is none worth trusting. */
+        static String urlExtension(String url) {
+            if (url == null || url.isEmpty()) return null;
+            String path;
+            try { path = new URI(url).getPath(); } catch (URISyntaxException e) { return null; }
+            if (path == null) return null;
+            Matcher m = URL_EXTENSION.matcher(path.substring(path.lastIndexOf('/') + 1));
+            if (!m.find()) return null;
+            String ext = m.group(1).toLowerCase(Locale.ROOT);
+            return SCRIPT_EXTENSIONS.contains(ext) ? null : ext;
+        }
+
+        static String dispositionName(String contentDisposition) {
+            String name = "";
+            if (contentDisposition != null) {
+                Matcher m = DISPOSITION_EXT.matcher(contentDisposition);
+                if (m.find()) name = decodeExtValue(m.group(1).trim());
+                if (name.isBlank()) {
+                    m = DISPOSITION_NAME.matcher(contentDisposition);
+                    if (m.find()) name = m.group(1) != null ? m.group(1).replaceAll("\\\\(.)", "$1") : m.group(2).trim();
+                }
+            }
+            return safeFileName(name);
+        }
+
+        /** RFC 8187 ext-value: charset'language'percent-encoded bytes. Returns "" when malformed. */
+        static String decodeExtValue(String v) {
+            if (v.length() >= 2 && v.startsWith("\"") && v.endsWith("\"")) v = v.substring(1, v.length() - 1);
+            String[] parts = v.split("'", 3);
+            if (parts.length != 3) return "";
+            Charset cs;
+            try { cs = Charset.forName(parts[0].trim()); } catch (Exception e) { cs = StandardCharsets.UTF_8; }
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            String s = parts[2];
+            for (int i = 0; i < s.length(); i++) {
+                char ch = s.charAt(i);
+                if (ch == '%' && i + 2 < s.length() && hex(s.charAt(i + 1)) >= 0 && hex(s.charAt(i + 2)) >= 0) {
+                    out.write(hex(s.charAt(i + 1)) * 16 + hex(s.charAt(i + 2)));
+                    i += 2;
+                } else {
+                    byte[] b = String.valueOf(ch).getBytes(StandardCharsets.UTF_8);
+                    out.write(b, 0, b.length);
+                }
+            }
+            return out.toString(cs);
+        }
+
+        private static int hex(char c) { return Character.digit(c, 16); }
+
+        /** Drops any directory part (a server must not choose where the file goes) and characters Windows rejects. */
+        static String safeFileName(String name) {
+            String n = name.substring(Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\')) + 1);
+            n = n.replaceAll("[<>:\"|?*\\x00-\\x1f]", "_").strip();
+            n = n.replaceAll("[. ]+$", "");
+            if (RESERVED_FILE.matcher(n).matches()) n = "_" + n;
+            return n;
         }
 
         private static synchronized HttpClient client(Settings s) {
@@ -2822,8 +2960,13 @@ public class PortableRestClient {
 
         // ---------------------------------------------------------------- sending
 
-        /** Sends the tab's draft: what you see is what is sent, saved or not. */
-        void sendOrCancel() {
+        void sendOrCancel() { sendOrCancel(false); }
+
+        /**
+         * Sends the tab's draft: what you see is what is sent, saved or not. With {@code download} the
+         * body is saved to a file (asked for when the response arrives) instead of being rendered.
+         */
+        void sendOrCancel(boolean download) {
             RequestTab t = current();
             if (t == null) return;
             CompletableFuture<Response> running = inFlight.get(t.saved);
@@ -2845,11 +2988,11 @@ public class PortableRestClient {
             inFlight.put(t.saved, f);
             t.editor.updateSendButton();
             responseView.show(null, true);
-            f.whenComplete((res, ex) -> SwingUtilities.invokeLater(() -> finished(t, f, c, env, p, res, ex)));
+            f.whenComplete((res, ex) -> SwingUtilities.invokeLater(() -> finished(t, f, c, env, p, res, ex, download)));
         }
 
         void finished(RequestTab t, CompletableFuture<Response> f, Collection c, Environment env, Engine.Prepared p,
-                      Response res, Throwable ex) {
+                      Response res, Throwable ex, boolean download) {
             // Not in the map any more: its tab was closed (or its request deleted) and nobody is waiting for it.
             if (!inFlight.remove(t.saved, f)) return;
             Response shown;
@@ -2867,7 +3010,44 @@ public class PortableRestClient {
             }
             results.put(t.saved, shown);
             t.editor.updateSendButton();
-            if (current() == t) responseView.show(shown, false);
+            if (download && res != null) {
+                res.awaitingSave = true;
+                if (current() != t) selectTab(t); // the dialog belongs next to the request it was sent from
+                else responseView.show(res, false);
+                res.savedTo = saveResponse(res);
+                res.awaitingSave = false;
+                if (res.savedTo == null) res.messages.add("The body was not saved to a file, so it is shown instead");
+                if (responseView.shown == res) responseView.show(res, false);
+            } else if (current() == t) responseView.show(shown, false);
+        }
+
+        /** Asks where to save the response body, suggesting the Content-Disposition name. Returns null when not saved. */
+        Path saveResponse(Response r) {
+            File dir = ws.downloadDir.isEmpty() ? null : new File(ws.downloadDir);
+            // A folder that has since been removed (or a drive that is gone) falls back to the default one.
+            JFileChooser fc = new JFileChooser(dir != null && dir.isDirectory() ? dir : null);
+            fc.setDialogTitle("Save Response");
+            fc.setSelectedFile(new File(fc.getCurrentDirectory(), r.fileName()));
+            File target;
+            while (true) {
+                if (fc.showSaveDialog(frame) != JFileChooser.APPROVE_OPTION) return null;
+                target = fc.getSelectedFile();
+                if (!target.exists() || JOptionPane.showConfirmDialog(frame, target.getName() + " already exists. Replace it?",
+                        "Save Response", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE) == JOptionPane.YES_OPTION) break;
+            }
+            Path path = target.toPath().toAbsolutePath();
+            try {
+                Files.write(path, r.bytes);
+            } catch (IOException e) {
+                JOptionPane.showMessageDialog(frame, "Could not save the response:\n" + e, APP, JOptionPane.ERROR_MESSAGE);
+                return null;
+            }
+            // The file's own folder, not the chooser's: a full path typed into the name field can point elsewhere.
+            ws.downloadDir = path.getParent() == null ? "" : path.getParent().toString();
+            saveTimer.restart();
+            r.messages.add("Body saved to " + path + " (" + formatSize(r.bytes.length) + ")");
+            statusBar.setText("Saved response to " + path);
+            return path;
         }
 
         // ---------------------------------------------------------------- request tabs
@@ -3403,6 +3583,8 @@ public class PortableRestClient {
                 @Override public String getToolTipText(MouseEvent e) { return varTipAt(this, e, vars()); }
             };
             final JButton send = new JButton("Send");
+            /** Opens the send options (Send / Send and Download). */
+            final JButton sendMenu = new JButton("▾");
             final KvTable params = new KvTable("Key", "Value", this::paramsChanged);
             final KvTable headers = new KvTable("Header", "Value", this::tableChanged);
             final KvTable post = new KvTable("Variable", "JSON path (empty = whole body)", this::tableChanged);
@@ -3451,11 +3633,27 @@ public class PortableRestClient {
                 send.addActionListener(e -> sendOrCancel());
                 send.setPreferredSize(new Dimension(90, send.getPreferredSize().height));
                 send.setToolTipText("Send (Ctrl+Enter)");
+                JPopupMenu sendOptions = new JPopupMenu();
+                JMenuItem sendItem = new JMenuItem("Send");
+                sendItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, InputEvent.CTRL_DOWN_MASK));
+                sendItem.addActionListener(e -> sendOrCancel(false));
+                JMenuItem downloadItem = new JMenuItem("Send and Download…");
+                downloadItem.setToolTipText("Save the response body to a file instead of showing it");
+                downloadItem.addActionListener(e -> sendOrCancel(true));
+                sendOptions.add(sendItem);
+                sendOptions.add(downloadItem);
+                sendMenu.setMargin(new Insets(sendMenu.getMargin().top, 4, sendMenu.getMargin().bottom, 4));
+                sendMenu.setFocusable(false);
+                sendMenu.setToolTipText("Send options: render the response or download it to a file");
+                sendMenu.addActionListener(e -> sendOptions.show(sendMenu, 0, sendMenu.getHeight()));
 
+                JPanel sendButtons = new JPanel(new BorderLayout(1, 0));
+                sendButtons.add(send, BorderLayout.CENTER);
+                sendButtons.add(sendMenu, BorderLayout.EAST);
                 JPanel line = new JPanel(new BorderLayout(6, 0));
                 line.add(method, BorderLayout.WEST);
                 line.add(url, BorderLayout.CENTER);
-                line.add(send, BorderLayout.EAST);
+                line.add(sendButtons, BorderLayout.EAST);
                 breadcrumb.setForeground(Color.GRAY);
                 save.setToolTipText("Save this request (Ctrl+S); Ctrl+Shift+S saves all tabs");
                 save.setFocusable(false);
@@ -3722,7 +3920,9 @@ public class PortableRestClient {
             }
 
             void updateSendButton() {
-                send.setText(inFlight.containsKey(tab.saved) ? "Cancel" : "Send");
+                boolean running = inFlight.containsKey(tab.saved);
+                send.setText(running ? "Cancel" : "Send");
+                sendMenu.setEnabled(!running);
             }
 
             void updateSaveButton() {
@@ -3738,6 +3938,7 @@ public class PortableRestClient {
             final JLabel meta = new JLabel(" ");
             final JTextArea body = new JTextArea();
             final JCheckBox pretty = new JCheckBox("Pretty", true);
+            final JButton saveBody = new JButton("Save to File…");
             final DefaultTableModel headerModel = new DefaultTableModel(new Object[] {"Header", "Value"}, 0) {
                 @Override public boolean isCellEditable(int r, int c) { return false; }
             };
@@ -3759,8 +3960,20 @@ public class PortableRestClient {
                 body.setTabSize(2);
                 pretty.addActionListener(e -> renderBody());
                 pretty.setEnabled(false);
-                JPanel bodyBar = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 2));
-                bodyBar.add(pretty);
+                saveBody.setEnabled(false);
+                saveBody.setFocusable(false);
+                saveBody.setToolTipText("Save the response body as received (after gzip/deflate decoding)");
+                saveBody.addActionListener(e -> {
+                    Response r = shown;
+                    if (r != null && saveResponse(r) != null && shown == r) show(r, false); // updates the Log tab
+                });
+                JPanel bodyBar = new JPanel(new BorderLayout());
+                JPanel bodyLeft = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 2));
+                bodyLeft.add(pretty);
+                JPanel bodyRight = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 2));
+                bodyRight.add(saveBody);
+                bodyBar.add(bodyLeft, BorderLayout.CENTER);
+                bodyBar.add(bodyRight, BorderLayout.EAST);
                 JPanel bodyPanel = new JPanel(new BorderLayout());
                 bodyPanel.add(bodyBar, BorderLayout.NORTH);
                 bodyPanel.add(FindBar.wrap(body, LineNumbers.scroll(body)), BorderLayout.CENTER);
@@ -3782,6 +3995,7 @@ public class PortableRestClient {
                 tabs.setTitleAt(1, "Headers");
                 tabs.setTitleAt(2, "Log");
                 pretty.setEnabled(false);
+                saveBody.setEnabled(!sending && r != null && r.error == null);
                 status.setForeground(Color.GRAY);
                 meta.setText(" ");
                 if (sending || r == null) {
@@ -3818,9 +4032,13 @@ public class PortableRestClient {
             void renderBody() {
                 Response r = shown;
                 if (r == null || r.error != null) return;
-                pretty.setEnabled(r.pretty != null);
+                pretty.setEnabled(r.pretty != null && r.savedTo == null && !r.awaitingSave);
                 String t;
-                if (r.text == null)
+                if (r.awaitingSave) t = "Choose where to save the response body (" + formatSize(r.bytes.length) + ")…";
+                else if (r.savedTo != null)
+                    t = "Response body saved to:\n" + r.savedTo + "\n\n" + formatSize(r.bytes.length)
+                            + (r.contentType.isEmpty() ? "" : ", " + r.contentType);
+                else if (r.text == null)
                     t = "<binary body: " + formatSize(r.bytes.length) + (r.contentType.isEmpty() ? "" : ", " + r.contentType) + ">";
                 else t = pretty.isSelected() && r.pretty != null ? r.pretty : r.text;
                 if (t.length() > DISPLAY_LIMIT)
@@ -3853,6 +4071,7 @@ public class PortableRestClient {
             t.section("urls", t::urls);
             t.section("variables", t::variables);
             t.section("curl", t::curl);
+            t.section("download", t::download);
             t.section("postman", t::postman);
             t.section("storage", t::storage);
             t.section("http", t::http);
@@ -3981,6 +4200,51 @@ public class PortableRestClient {
             r.setUrl("ftp://x/y");
             fails("ftp rejected", () -> Engine.prepare(r, v));
         }
+
+        void download() {
+            eq("dl none", "response.txt", dl(null));
+            eq("dl empty", "response.txt", dl(""));
+            eq("dl inline", "response.txt", dl("inline"));
+            eq("dl quoted", "data.csv", dl("attachment; filename=\"data.csv\""));
+            eq("dl token", "data.json", dl("attachment; filename=data.json"));
+            eq("dl spaces around =", "a.zip", dl("attachment;filename = a.zip ; size=10"));
+            eq("dl quoted semicolon", "a;b.txt", dl("attachment; filename=\"a;b.txt\""));
+            eq("dl escaped quote", "say _hi_.txt", dl("attachment; filename=\"say \\\"hi\\\".txt\""));
+            eq("dl no extension", "report.txt", dl("attachment; filename=\"report\""));
+            eq("dl ext-value wins", "€ rates.csv",
+                    dl("attachment; filename=\"EURO rates.csv\"; filename*=UTF-8''%e2%82%ac%20rates.csv"));
+            eq("dl ext-value first", "naïve.txt", dl("attachment; filename*=utf-8'en'na%C3%AFve.txt; filename=x.bin"));
+            eq("dl ext-value latin1", "café.txt", dl("attachment; filename*=ISO-8859-1''caf%E9.txt"));
+            eq("dl bad ext-value falls back", "x.bin", dl("attachment; filename*=garbage; filename=x.bin"));
+            eq("dl case-insensitive", "Up.PNG", dl("ATTACHMENT; FILENAME=\"Up.PNG\""));
+            eq("dl path dropped", "passwd.txt", dl("attachment; filename=\"../../etc/passwd\""));
+            eq("dl windows path dropped", "evil.exe", dl("attachment; filename=\"C:\\\\Windows\\\\evil.exe\""));
+            eq("dl illegal chars", "a_b_c.txt", dl("attachment; filename=\"a<b>c.txt\""));
+            eq("dl trailing dots", "name.txt", dl("attachment; filename=\"name...\""));
+            eq("dl reserved name", "_CON.txt", dl("attachment; filename=CON.txt"));
+            eq("dl only dots", "response.txt", dl("attachment; filename=\"..\""));
+            eq("dl dotfile", ".env.txt", dl("attachment; filename=.env"));
+
+            // Extension when Content-Disposition doesn't give one: Content-Type, then the URL, then txt.
+            String cd = "attachment; filename=\"report\"";
+            eq("ext from type", "report.pdf", Engine.downloadName(cd, "application/pdf", "https://h/x"));
+            eq("ext type params ignored", "response.json", Engine.downloadName(null, "Application/JSON; charset=utf-8", ""));
+            eq("ext type +json", "response.json", Engine.downloadName(null, "application/problem+json", ""));
+            eq("ext type +xml", "response.xml", Engine.downloadName(null, "application/atom+xml", ""));
+            eq("ext jpeg", "response.jpg", Engine.downloadName(null, "image/jpeg", "https://h/photo"));
+            eq("ext type beats url", "response.png", Engine.downloadName(null, "image/png", "https://h/img.jpg"));
+            eq("ext url for octet-stream", "report.zip", Engine.downloadName(cd, "application/octet-stream", "https://h/f/archive.zip?v=2"));
+            eq("ext url for text/plain", "response.log", Engine.downloadName(null, "text/plain; charset=utf-8", "https://h/logs/app.LOG"));
+            eq("ext url without type", "response.csv", Engine.downloadName(null, "", "https://h/data.csv#top"));
+            eq("ext url encoded path", "response.pdf", Engine.downloadName(null, null, "https://h/my%20file.pdf"));
+            eq("ext url script ignored", "response.txt", Engine.downloadName(null, "application/octet-stream", "https://h/download.php?id=1"));
+            eq("ext url dir ignored", "response.txt", Engine.downloadName(null, "", "https://h/v1.2/items"));
+            eq("ext url bad", "response.txt", Engine.downloadName(null, "", "not a url"));
+            eq("ext disposition kept", "a.csv", Engine.downloadName("attachment; filename=a.csv", "application/pdf", "https://h/b.zip"));
+            eq("ext unknown type", "response.txt", Engine.downloadName(null, "application/x-something", "https://h/x"));
+        }
+
+        static String dl(String contentDisposition) { return Engine.downloadName(contentDisposition, "", ""); }
 
         void curl() {
             Request r = new Request("c");
@@ -4159,6 +4423,10 @@ public class PortableRestClient {
             check("tree scroll defaults to left", legacy.treeScrollX == 0 && !Storage.toJson(legacy).containsKey("treeScrollX"));
             legacy.treeScrollX = 57;
             eq("tree scroll round trip", 57, Storage.fromJson(Storage.toJson(legacy)).treeScrollX);
+            check("download dir defaults to none", legacy.downloadDir.isEmpty() && !Storage.toJson(legacy).containsKey("downloadDir"));
+            legacy.downloadDir = "C:\\Users\\me\\Downloads\\api files";
+            eq("download dir round trip", legacy.downloadDir,
+                    Storage.fromJson(Json.obj(Json.parse(Json.pretty(Storage.toJson(legacy))))).downloadDir);
 
             w.openTabs.add(new OpenTab(original.id, false, copy));
             w.openTabs.add(new OpenTab("gone", true, null));
@@ -4278,6 +4546,14 @@ public class PortableRestClient {
                 ex.close();
             });
             server.createContext("/fail", ex -> { ex.sendResponseHeaders(500, -1); ex.close(); });
+            server.createContext("/download", ex -> {
+                byte[] out = {0x25, 0x50, 0x44, 0x46, 0, (byte) 0xff};
+                ex.getResponseHeaders().add("Content-Type", "application/pdf");
+                ex.getResponseHeaders().add("Content-Disposition", "attachment; filename=\"report 2026.pdf\"");
+                ex.sendResponseHeaders(200, out.length);
+                ex.getResponseBody().write(out);
+                ex.close();
+            });
             server.createContext("/slow", ex -> {
                 try { Thread.sleep(3000); } catch (InterruptedException ignored) { }
                 ex.sendResponseHeaders(204, -1);
@@ -4339,6 +4615,13 @@ public class PortableRestClient {
                 g.setUrl("http://127.0.0.1:{{port}}/gzip");
                 Response gz = Engine.send(Engine.prepare(g, Engine.variables(c, env)), s).get(15, TimeUnit.SECONDS);
                 eq("http gzip decoded", "hello gzip", gz.text);
+                eq("no disposition gives default name", "response.txt", gz.fileName());
+
+                Request dl = new Request("download");
+                dl.setUrl("http://127.0.0.1:{{port}}/download");
+                Response dr = Engine.send(Engine.prepare(dl, Engine.variables(c, env)), s).get(15, TimeUnit.SECONDS);
+                eq("download name from header", "report 2026.pdf", dr.fileName());
+                check("download keeps raw bytes", Arrays.equals(new byte[] {0x25, 0x50, 0x44, 0x46, 0, (byte) 0xff}, dr.bytes));
 
                 Request f = new Request("fail");
                 f.setUrl("http://127.0.0.1:{{port}}/fail");
